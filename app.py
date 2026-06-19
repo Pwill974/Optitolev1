@@ -206,9 +206,11 @@ if st.button("3. Analyser les correspondances", type="primary", use_container_wi
             csv_output = df.to_csv(index=False, sep=";").encode("utf-8-sig")
             st.download_button("Télécharger le rapport CSV", csv_output,
                                "rapport_correspondances.csv", "text/csv")
-            if unused:
-                st.warning("DXF non utilisés :
-
+            
+if unused:
+                st.warning("DXF non utilisés :\n\n- " + "\n- ".join(unused))
+            else:
+                st.success("Tous les DXF ont été associés.")
 - " + "
 - ".join(unused))
             else:
