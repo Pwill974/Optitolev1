@@ -529,23 +529,35 @@ def rotated_at_origin(polygon: Polygon, angle: int) -> Polygon:
 def candidate_positions(
     placed_polygons: list[Polygon],
     margin: float,
+    clearance: float,
 ) -> list[tuple[float, float]]:
     """
-    Génère uniquement des positions utiles autour des pièces existantes.
+    Génère des positions autour des pièces déjà placées.
 
-    L'ancienne version combinait toutes les coordonnées X avec toutes les
-    coordonnées Y, ce qui pouvait produire des milliers de tests. Cette
-    version reste linéaire par rapport au nombre de pièces déjà placées.
+    L'espacement est ajouté aux coordonnées de droite et du haut.
+    Sans cet ajout, chaque nouvelle pièce touchait la précédente,
+    était refusée par le contrôle de distance, puis partait sur
+    une nouvelle tôle.
     """
     candidates = {(round(margin, 6), round(margin, 6))}
 
     for polygon in placed_polygons:
         min_x, min_y, max_x, max_y = polygon.bounds
 
-        candidates.add((round(max_x, 6), round(min_y, 6)))
-        candidates.add((round(min_x, 6), round(max_y, 6)))
-        candidates.add((round(max_x, 6), round(margin, 6)))
-        candidates.add((round(margin, 6), round(max_y, 6)))
+        right_x = max_x + clearance
+        top_y = max_y + clearance
+
+        # À droite et au-dessus de chaque pièce.
+        candidates.add((round(right_x, 6), round(min_y, 6)))
+        candidates.add((round(min_x, 6), round(top_y, 6)))
+
+        # Alignement avec les bords bas et gauche de la tôle.
+        candidates.add((round(right_x, 6), round(margin, 6)))
+        candidates.add((round(margin, 6), round(top_y, 6)))
+
+        # Deux positions supplémentaires pour mieux remplir les rangées.
+        candidates.add((round(right_x, 6), round(top_y, 6)))
+        candidates.add((round(min_x, 6), round(margin, 6)))
 
     return sorted(candidates, key=lambda position: (position[1], position[0]))
 
@@ -704,7 +716,7 @@ def nest_pieces(
                 default=margin,
             )
 
-            positions = candidate_positions(current_polygons, margin)
+            positions = candidate_positions(current_polygons, margin, clearance)
             best = None
 
             for angle, rotated in rotated_versions:
@@ -1009,9 +1021,10 @@ st.set_page_config(
     layout="wide",
 )
 
-st.title("📐 OptiTôle Pro v5")
+st.title("📐 OptiTôle Pro v6")
 st.caption(
-    "Nesting de tôles à partir de DXF Advance Steel et d'une nomenclature Excel/CSV."
+    "Nesting de tôles à partir de DXF Advance Steel et d'une nomenclature Excel/CSV. "
+    "Version 6 : répartition multi-pièces corrigée."
 )
 
 with st.sidebar:
