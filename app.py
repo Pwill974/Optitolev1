@@ -114,6 +114,36 @@ def normalize_header(value: object) -> str:
     return re.sub(r"[^a-z0-9]+", "", text)
 
 
+def reference_from_dxf_filename(filename: str) -> str:
+    """
+    Extrait le repère réel depuis un nom de fichier Advance Steel.
+
+    Exemples :
+        NC/13.nc.dxf          -> 13
+        NC/AT1.nc.dxf         -> AT1
+        NC/AT1.nc.err.dxf     -> AT1
+        NC/AT1A11.nc.err.dxf  -> AT1A11
+        10.dxf                -> 10
+    """
+    filename_only = Path(filename).name
+
+    # Retirer l'extension finale .dxf.
+    cleaned = re.sub(r"(?i)\.dxf$", "", filename_only).strip()
+
+    # Retirer successivement les suffixes techniques ajoutés par Advance Steel.
+    technical_suffixes = ("nc", "err", "dstv", "cnc", "cam")
+
+    while True:
+        previous = cleaned
+        suffix_pattern = r"(?i)\.(?:" + "|".join(technical_suffixes) + r")$"
+        cleaned = re.sub(suffix_pattern, "", cleaned).strip()
+
+        if cleaned == previous:
+            break
+
+    return normalize_reference(cleaned)
+
+
 def normalize_group_value(value: object, fallback: str) -> str:
     text = cell_to_text(value)
     return text if text else fallback
@@ -425,7 +455,7 @@ def read_dxf_zip(uploaded_file) -> dict[str, tuple[str, bytes]]:
                 if name.endswith("/") or Path(name).suffix.lower() != ".dxf":
                     continue
 
-                key = normalize_reference(Path(name).stem)
+                key = reference_from_dxf_filename(name)
                 if not key:
                     continue
 
@@ -871,7 +901,7 @@ st.set_page_config(
     layout="wide",
 )
 
-st.title("📐 OptiTôle Pro")
+st.title("📐 OptiTôle Pro v3")
 st.caption(
     "Nesting de tôles à partir de DXF Advance Steel et d'une nomenclature Excel/CSV."
 )
