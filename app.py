@@ -530,16 +530,47 @@ def candidate_positions(
     placed_polygons: list[Polygon],
     margin: float,
 ) -> list[tuple[float, float]]:
-    xs = {margin}
-    ys = {margin}
+    """
+    Génère uniquement des positions utiles autour des pièces existantes.
+
+    L'ancienne version combinait toutes les coordonnées X avec toutes les
+    coordonnées Y, ce qui pouvait produire des milliers de tests. Cette
+    version reste linéaire par rapport au nombre de pièces déjà placées.
+    """
+    candidates = {(round(margin, 6), round(margin, 6))}
 
     for polygon in placed_polygons:
-        _, _, max_x, max_y = polygon.bounds
-        xs.add(round(max_x, 6))
-        ys.add(round(max_y, 6))
+        min_x, min_y, max_x, max_y = polygon.bounds
 
-    candidates = [(x, y) for y in sorted(ys) for x in sorted(xs)]
-    return candidates
+        candidates.add((round(max_x, 6), round(min_y, 6)))
+        candidates.add((round(min_x, 6), round(max_y, 6)))
+        candidates.add((round(max_x, 6), round(margin, 6)))
+        candidates.add((round(margin, 6), round(max_y, 6)))
+
+    return sorted(candidates, key=lambda position: (position[1], position[0]))
+
+
+def bounds_are_close(
+    first_bounds: tuple[float, float, float, float],
+    second_bounds: tuple[float, float, float, float],
+    clearance: float,
+) -> bool:
+    """
+    Filtre rapide par rectangles englobants avant le calcul géométrique exact.
+    """
+    first_min_x, first_min_y, first_max_x, first_max_y = first_bounds
+    second_min_x, second_min_y, second_max_x, second_max_y = second_bounds
+
+    if first_max_x + clearance <= second_min_x:
+        return False
+    if second_max_x + clearance <= first_min_x:
+        return False
+    if first_max_y + clearance <= second_min_y:
+        return False
+    if second_max_y + clearance <= first_min_y:
+        return False
+
+    return True
 
 
 def fits_on_sheet(
@@ -551,27 +582,31 @@ def fits_on_sheet(
     if not sheet_inner.covers(polygon):
         return False
 
+    candidate_bounds = polygon.bounds
+
     for other in placed_polygons:
-        if polygon.buffer(clearance / 2.0).intersects(
-            other.buffer(clearance / 2.0)
-        ):
+        if not bounds_are_close(candidate_bounds, other.bounds, clearance):
+            continue
+
+        if polygon.intersects(other):
+            return False
+
+        if clearance > 0 and polygon.distance(other) < clearance - 1e-7:
             return False
 
     return True
 
 
-def placement_score(polygon: Polygon, placed_polygons: list[Polygon]) -> tuple:
+def placement_score(
+    polygon: Polygon,
+    current_max_x: float,
+    current_max_y: float,
+) -> tuple:
     min_x, min_y, max_x, max_y = polygon.bounds
 
-    if placed_polygons:
-        merged_bounds = unary_union(placed_polygons + [polygon]).bounds
-        _, _, merged_max_x, merged_max_y = merged_bounds
-    else:
-        merged_max_x, merged_max_y = max_x, max_y
-
     return (
-        round(merged_max_y, 6),
-        round(merged_max_x, 6),
+        round(max(current_max_y, max_y), 6),
+        round(max(current_max_x, max_x), 6),
         round(min_y, 6),
         round(min_x, 6),
     )
@@ -605,6 +640,7 @@ def nest_pieces(
     margin: float,
     clearance: float,
     rotations: list[int],
+    progress_callback=None,
 ) -> tuple[list[Placement], int, list[str]]:
     if sheet_width <= 0 or sheet_height <= 0:
         raise ValueError("Les dimensions de la tôle doivent être positives.")
@@ -628,23 +664,67 @@ def nest_pieces(
     sheets: list[list[Placement]] = []
     unplaced: list[str] = []
 
-    for piece, copy_index in expand_piece_copies(pieces):
+    expanded_pieces = expand_piece_copies(pieces)
+    total_copies = len(expanded_pieces)
+
+    # Une rotation est calculée une seule fois par repère, puis réutilisée
+    # pour toutes les copies de cette pièce.
+    rotation_cache: dict[tuple[str, int], Polygon] = {}
+
+    for item_index, (piece, copy_index) in enumerate(expanded_pieces, start=1):
         placed_successfully = False
 
+        rotated_versions: list[tuple[int, Polygon]] = []
+
+        for angle in rotations:
+            cache_key = (piece.reference_key, angle)
+
+            if cache_key not in rotation_cache:
+                rotation_cache[cache_key] = rotated_at_origin(
+                    piece.polygon,
+                    angle,
+                )
+
+            rotated_versions.append(
+                (angle, rotation_cache[cache_key])
+            )
+
         for sheet_index, sheet_placements in enumerate(sheets):
-            current_polygons = [placement.polygon for placement in sheet_placements]
+            current_polygons = [
+                placement.polygon
+                for placement in sheet_placements
+            ]
+
+            current_max_x = max(
+                (polygon.bounds[2] for polygon in current_polygons),
+                default=margin,
+            )
+            current_max_y = max(
+                (polygon.bounds[3] for polygon in current_polygons),
+                default=margin,
+            )
+
+            positions = candidate_positions(current_polygons, margin)
             best = None
 
-            for angle in rotations:
-                rotated = rotated_at_origin(piece.polygon, angle)
+            for angle, rotated in rotated_versions:
                 width = rotated.bounds[2] - rotated.bounds[0]
                 height = rotated.bounds[3] - rotated.bounds[1]
 
                 if width > inner_width + 1e-6 or height > inner_height + 1e-6:
                     continue
 
-                for x, y in candidate_positions(current_polygons, margin):
-                    candidate = affinity.translate(rotated, xoff=x, yoff=y)
+                for x, y in positions:
+                    if x + width > sheet_width - margin + 1e-6:
+                        continue
+                    if y + height > sheet_height - margin + 1e-6:
+                        continue
+
+                    candidate = affinity.translate(
+                        rotated,
+                        xoff=x,
+                        yoff=y,
+                    )
 
                     if not fits_on_sheet(
                         candidate,
@@ -654,12 +734,32 @@ def nest_pieces(
                     ):
                         continue
 
-                    score = placement_score(candidate, current_polygons)
+                    score = placement_score(
+                        candidate,
+                        current_max_x,
+                        current_max_y,
+                    )
+
                     if best is None or score < best[0]:
                         best = (score, angle, candidate)
 
+                        # La position bas-gauche parfaite peut être acceptée
+                        # immédiatement pour réduire encore les essais.
+                        if (
+                            abs(candidate.bounds[0] - margin) < 1e-6
+                            and abs(candidate.bounds[1] - margin) < 1e-6
+                        ):
+                            break
+
+                if best is not None and best[0][2:] == (
+                    round(margin, 6),
+                    round(margin, 6),
+                ):
+                    break
+
             if best is not None:
                 _, angle, candidate = best
+
                 sheet_placements.append(
                     Placement(
                         reference=piece.reference_display,
@@ -673,54 +773,62 @@ def nest_pieces(
                         material=piece.material,
                     )
                 )
+
                 placed_successfully = True
                 break
 
-        if placed_successfully:
-            continue
+        if not placed_successfully:
+            best = None
 
-        # Créer une nouvelle tôle
-        best = None
-        empty_polygons: list[Polygon] = []
+            for angle, rotated in rotated_versions:
+                width = rotated.bounds[2] - rotated.bounds[0]
+                height = rotated.bounds[3] - rotated.bounds[1]
 
-        for angle in rotations:
-            rotated = rotated_at_origin(piece.polygon, angle)
-            width = rotated.bounds[2] - rotated.bounds[0]
-            height = rotated.bounds[3] - rotated.bounds[1]
+                if width > inner_width + 1e-6 or height > inner_height + 1e-6:
+                    continue
 
-            if width > inner_width + 1e-6 or height > inner_height + 1e-6:
-                continue
-
-            candidate = affinity.translate(rotated, xoff=margin, yoff=margin)
-
-            if fits_on_sheet(candidate, empty_polygons, sheet_inner, clearance):
-                score = placement_score(candidate, empty_polygons)
-                if best is None or score < best[0]:
-                    best = (score, angle, candidate)
-
-        if best is None:
-            unplaced.append(
-                f"{piece.reference_display} - copie {copy_index}"
-            )
-            continue
-
-        _, angle, candidate = best
-        new_sheet_index = len(sheets)
-        sheets.append(
-            [
-                Placement(
-                    reference=piece.reference_display,
-                    source_name=piece.source_name,
-                    sheet_index=new_sheet_index,
-                    rotation=angle,
-                    polygon=candidate,
-                    original_polygon=piece.polygon,
-                    copy_index=copy_index,
-                    thickness=piece.thickness,
-                    material=piece.material,
+                candidate = affinity.translate(
+                    rotated,
+                    xoff=margin,
+                    yoff=margin,
                 )
-            ]
-        )
+
+                if sheet_inner.covers(candidate):
+                    score = placement_score(
+                        candidate,
+                        margin,
+                        margin,
+                    )
+
+                    if best is None or score < best[0]:
+                        best = (score, angle, candidate)
+
+            if best is None:
+                unplaced.append(
+                    f"{piece.reference_display} - copie {copy_index}"
+                )
+            else:
+                _, angle, candidate = best
+                new_sheet_index = len(sheets)
+
+                sheets.append(
+                    [
+                        Placement(
+                            reference=piece.reference_display,
+                            source_name=piece.source_name,
+                            sheet_index=new_sheet_index,
+                            rotation=angle,
+                            polygon=candidate,
+                            original_polygon=piece.polygon,
+                            copy_index=copy_index,
+                            thickness=piece.thickness,
+                            material=piece.material,
+                        )
+                    ]
+                )
+
+        if progress_callback is not None and total_copies:
+            progress_callback(item_index / total_copies)
 
     placements = [
         placement
@@ -901,7 +1009,7 @@ st.set_page_config(
     layout="wide",
 )
 
-st.title("📐 OptiTôle Pro v3")
+st.title("📐 OptiTôle Pro v5")
 st.caption(
     "Nesting de tôles à partir de DXF Advance Steel et d'une nomenclature Excel/CSV."
 )
@@ -940,15 +1048,18 @@ with st.sidebar:
     tolerance = st.number_input(
         "Précision des courbes DXF (mm)",
         min_value=0.1,
-        value=1.0,
-        step=0.1,
-        help="Plus la valeur est petite, plus les arcs sont précis mais le calcul est lourd.",
+        value=3.0,
+        step=0.5,
+        help=(
+            "3 mm est conseillé pour un premier calcul rapide. "
+            "Réduis ensuite à 1 mm pour le contrôle final."
+        ),
     )
 
     rotation_options = st.multiselect(
         "Rotations autorisées",
         options=[0, 90, 180, 270],
-        default=[0, 90, 180, 270],
+        default=[0, 90],
     )
 
     st.warning(
@@ -980,6 +1091,15 @@ run_button = st.button(
     use_container_width=True,
 )
 
+clear_results = st.button(
+    "Effacer les anciens résultats",
+    use_container_width=True,
+)
+
+if clear_results:
+    st.session_state.pop("optitole_result", None)
+    st.success("Les anciens résultats ont été effacés.")
+
 if run_button:
     if dxf_zip is None or nomenclature_file is None:
         st.warning("Charge le ZIP des DXF et la nomenclature.")
@@ -1001,45 +1121,56 @@ if run_button:
                 tolerance,
             )
 
-        if missing:
-            st.error(
-                "DXF manquants pour les repères : "
-                + ", ".join(missing)
-            )
-
-        if unused:
-            st.warning(
-                "DXF présents mais non utilisés : "
-                + ", ".join(unused)
-            )
-
         if not pieces:
             st.error("Aucune pièce ne peut être optimisée.")
             st.stop()
 
         groups = defaultdict(list)
+
         for piece in pieces:
             groups[(piece.material, piece.thickness)].append(piece)
 
         all_placements: list[Placement] = []
         group_reports = []
+        unplaced_messages = []
         export_files = io.BytesIO()
 
-        with zipfile.ZipFile(export_files, "w", zipfile.ZIP_DEFLATED) as master_zip:
+        with zipfile.ZipFile(
+            export_files,
+            "w",
+            zipfile.ZIP_DEFLATED,
+        ) as master_zip:
             global_sheet_offset = 0
 
             for (material, thickness), group_pieces in groups.items():
-                with st.spinner(
-                    f"Optimisation : {material} — épaisseur {thickness}..."
-                ):
-                    placements, sheet_count, unplaced = nest_pieces(
-                        group_pieces,
-                        sheet_width,
-                        sheet_height,
-                        margin,
-                        clearance,
-                        sorted(rotation_options),
+                total_group_copies = sum(
+                    piece.quantity
+                    for piece in group_pieces
+                )
+
+                st.write(
+                    f"Optimisation : **{material} — épaisseur {thickness}** "
+                    f"({total_group_copies} pièce(s))"
+                )
+
+                progress_bar = st.progress(0)
+
+                def update_group_progress(value):
+                    progress_bar.progress(
+                        min(100, max(0, int(value * 100)))
                     )
+
+                placements, sheet_count, unplaced = nest_pieces(
+                    group_pieces,
+                    sheet_width,
+                    sheet_height,
+                    margin,
+                    clearance,
+                    sorted(rotation_options),
+                    progress_callback=update_group_progress,
+                )
+
+                progress_bar.empty()
 
                 for placement in placements:
                     placement.sheet_index += global_sheet_offset
@@ -1057,110 +1188,190 @@ if run_button:
                 )
 
                 if unplaced:
-                    st.error(
-                        f"Pièces trop grandes ou non placées pour "
+                    unplaced_messages.append(
                         f"{material} / {thickness} : "
                         + ", ".join(unplaced)
                     )
 
+                local_placements = [
+                    Placement(
+                        reference=p.reference,
+                        source_name=p.source_name,
+                        sheet_index=(
+                            p.sheet_index
+                            - global_sheet_offset
+                        ),
+                        rotation=p.rotation,
+                        polygon=p.polygon,
+                        original_polygon=p.original_polygon,
+                        copy_index=p.copy_index,
+                        thickness=p.thickness,
+                        material=p.material,
+                    )
+                    for p in placements
+                ]
+
                 group_zip = export_sheets_zip(
-                    [
-                        Placement(
-                            reference=p.reference,
-                            source_name=p.source_name,
-                            sheet_index=p.sheet_index - global_sheet_offset,
-                            rotation=p.rotation,
-                            polygon=p.polygon,
-                            original_polygon=p.original_polygon,
-                            copy_index=p.copy_index,
-                            thickness=p.thickness,
-                            material=p.material,
-                        )
-                        for p in placements
-                    ],
+                    local_placements,
                     sheet_count,
                     sheet_width,
                     sheet_height,
                 )
 
-                safe_material = re.sub(r"[^A-Za-z0-9_-]+", "_", material)
-                safe_thickness = re.sub(r"[^A-Za-z0-9_-]+", "_", thickness)
+                safe_material = re.sub(
+                    r"[^A-Za-z0-9_-]+",
+                    "_",
+                    material,
+                )
 
-                with zipfile.ZipFile(io.BytesIO(group_zip)) as inner_zip:
+                safe_thickness = re.sub(
+                    r"[^A-Za-z0-9_-]+",
+                    "_",
+                    thickness,
+                )
+
+                with zipfile.ZipFile(
+                    io.BytesIO(group_zip)
+                ) as inner_zip:
                     for inner_name in inner_zip.namelist():
                         master_zip.writestr(
-                            f"{safe_material}_{safe_thickness}/{inner_name}",
+                            (
+                                f"{safe_material}_"
+                                f"{safe_thickness}/"
+                                f"{inner_name}"
+                            ),
                             inner_zip.read(inner_name),
                         )
 
                 global_sheet_offset += sheet_count
 
         total_sheets = global_sheet_offset
-
-        st.success(
-            f"Optimisation terminée : {len(all_placements)} pièce(s) "
-            f"placée(s) sur {total_sheets} tôle(s)."
-        )
-
-        st.subheader("3. Résumé par matière et épaisseur")
-        st.dataframe(
-            pd.DataFrame(group_reports),
-            use_container_width=True,
-            hide_index=True,
-        )
-
-        st.subheader("4. Résultats détaillés")
         details = placement_table(all_placements)
-        st.dataframe(
-            details,
-            use_container_width=True,
-            hide_index=True,
-        )
-
-        st.subheader("5. Aperçu des tôles")
-        if total_sheets > 0:
-            selected_sheet = st.selectbox(
-                "Choisir une tôle",
-                options=list(range(1, total_sheets + 1)),
-            )
-
-            figure = plot_sheet(
-                all_placements,
-                selected_sheet - 1,
-                sheet_width,
-                sheet_height,
-            )
-            st.pyplot(figure, clear_figure=True)
-
-        st.subheader("6. Téléchargements")
 
         details_csv = details.to_csv(
             index=False,
             sep=";",
         ).encode("utf-8-sig")
 
-        download_left, download_right = st.columns(2)
-
-        with download_left:
-            st.download_button(
-                "Télécharger le rapport CSV",
-                data=details_csv,
-                file_name="rapport_optitole.csv",
-                mime="text/csv",
-                use_container_width=True,
-            )
-
-        with download_right:
-            st.download_button(
-                "Télécharger les tôles DXF",
-                data=export_files.getvalue(),
-                file_name="optitole_resultats_dxf.zip",
-                mime="application/zip",
-                use_container_width=True,
-            )
+        st.session_state["optitole_result"] = {
+            "placements": all_placements,
+            "group_reports": group_reports,
+            "total_sheets": total_sheets,
+            "details": details,
+            "details_csv": details_csv,
+            "export_zip": export_files.getvalue(),
+            "sheet_width": sheet_width,
+            "sheet_height": sheet_height,
+            "missing": missing,
+            "unused": unused,
+            "unplaced_messages": unplaced_messages,
+        }
 
     except Exception as exc:
         st.exception(exc)
+
+
+# Les résultats sont affichés en dehors du bouton.
+# Ils restent donc visibles après un rafraîchissement ou un changement de tôle.
+result = st.session_state.get("optitole_result")
+
+if result is not None:
+    missing = result["missing"]
+    unused = result["unused"]
+    unplaced_messages = result["unplaced_messages"]
+    all_placements = result["placements"]
+    group_reports = result["group_reports"]
+    total_sheets = result["total_sheets"]
+    details = result["details"]
+    details_csv = result["details_csv"]
+    export_zip = result["export_zip"]
+    result_sheet_width = result["sheet_width"]
+    result_sheet_height = result["sheet_height"]
+
+    if missing:
+        st.error(
+            "DXF manquants pour les repères : "
+            + ", ".join(missing)
+        )
+
+    if unused:
+        st.warning(
+            "DXF présents mais non utilisés : "
+            + ", ".join(unused)
+        )
+
+    for message in unplaced_messages:
+        st.error(
+            "Pièces trop grandes ou non placées : "
+            + message
+        )
+
+    st.success(
+        f"Optimisation terminée : {len(all_placements)} pièce(s) "
+        f"placée(s) sur {total_sheets} tôle(s)."
+    )
+
+    st.subheader("3. Résumé final")
+    st.dataframe(
+        pd.DataFrame(group_reports),
+        use_container_width=True,
+        hide_index=True,
+    )
+
+    st.subheader("4. Résultats détaillés")
+    st.dataframe(
+        details,
+        use_container_width=True,
+        hide_index=True,
+    )
+
+    st.subheader("5. Aperçu des tôles")
+
+    if total_sheets > 0:
+        selected_sheet = st.selectbox(
+            "Choisir la tôle à afficher",
+            options=list(range(1, total_sheets + 1)),
+            key="selected_result_sheet",
+        )
+
+        figure = plot_sheet(
+            all_placements,
+            selected_sheet - 1,
+            result_sheet_width,
+            result_sheet_height,
+        )
+
+        st.pyplot(
+            figure,
+            clear_figure=True,
+        )
+
+    st.subheader("6. Télécharger les résultats")
+
+    download_left, download_right = st.columns(2)
+
+    with download_left:
+        st.download_button(
+            "Télécharger le rapport CSV",
+            data=details_csv,
+            file_name="rapport_optitole.csv",
+            mime="text/csv",
+            use_container_width=True,
+        )
+
+    with download_right:
+        st.download_button(
+            "Télécharger les tôles DXF",
+            data=export_zip,
+            file_name="optitole_resultats_dxf.zip",
+            mime="application/zip",
+            use_container_width=True,
+        )
+else:
+    st.info(
+        "Aucun résultat enregistré. "
+        "Clique sur « Analyser les DXF et optimiser les tôles »."
+    )
 
 st.divider()
 st.caption(
