@@ -4,6 +4,7 @@ import math
 import random
 import re
 import tempfile
+import time
 import unicodedata
 import zipfile
 from collections import defaultdict
@@ -679,7 +680,7 @@ def rotated_at_origin(polygon: Polygon, angle: int) -> Polygon:
     return affinity.translate(rotated, xoff=-min_x, yoff=-min_y)
 
 
-def sampled_coordinates(ring, maximum: int = 20) -> list[tuple[float, float]]:
+def sampled_coordinates(ring, maximum: int = 12) -> list[tuple[float, float]]:
     coordinates = list(ring.coords)
 
     if len(coordinates) <= maximum:
@@ -701,10 +702,17 @@ def candidate_positions(
     sheet_height: float,
     allow_hole_nesting: bool,
     quality_level: int,
+    max_candidates: int,
 ) -> list[tuple[float, float]]:
+    """
+    Produit un nombre limité de positions utiles.
+
+    Le plafonnement évite qu'une pièce complexe génère plusieurs milliers
+    de calculs et bloque Streamlit Cloud.
+    """
     width = rotated_piece.bounds[2] - rotated_piece.bounds[0]
     height = rotated_piece.bounds[3] - rotated_piece.bounds[1]
-    candidates = {(round(margin, 5), round(margin, 5))}
+    candidates = {(round(margin, 4), round(margin, 4))}
 
     for polygon in placed_polygons:
         min_x, min_y, max_x, max_y = polygon.bounds
@@ -713,7 +721,7 @@ def candidate_positions(
         left_x = min_x - clearance - width
         bottom_y = min_y - clearance - height
 
-        basic = {
+        basic_positions = (
             (right_x, min_y),
             (right_x, margin),
             (min_x, top_y),
@@ -721,16 +729,16 @@ def candidate_positions(
             (right_x, top_y),
             (left_x, min_y),
             (min_x, bottom_y),
-        }
+        )
 
-        for x, y in basic:
+        for x, y in basic_positions:
             if (
                 x >= margin - 1e-6
                 and y >= margin - 1e-6
                 and x + width <= sheet_width - margin + 1e-6
                 and y + height <= sheet_height - margin + 1e-6
             ):
-                candidates.add((round(x, 5), round(y, 5)))
+                candidates.add((round(x, 4), round(y, 4)))
 
         if allow_hole_nesting:
             for interior in polygon.interiors:
@@ -739,52 +747,71 @@ def candidate_positions(
                 hole_width = hole_max_x - hole_min_x
                 hole_height = hole_max_y - hole_min_y
 
-                hole_candidates = {
-                    (hole_min_x + clearance, hole_min_y + clearance),
-                    (
-                        hole_max_x - clearance - width,
-                        hole_min_y + clearance,
-                    ),
-                    (
-                        hole_min_x + clearance,
-                        hole_max_y - clearance - height,
-                    ),
-                    (
-                        hole.centroid.x - width / 2.0,
-                        hole.centroid.y - height / 2.0,
-                    ),
-                }
+                if (
+                    hole_width + 1e-6 >= width + 2 * clearance
+                    and hole_height + 1e-6 >= height + 2 * clearance
+                ):
+                    hole_positions = (
+                        (hole_min_x + clearance, hole_min_y + clearance),
+                        (
+                            hole_max_x - clearance - width,
+                            hole_min_y + clearance,
+                        ),
+                        (
+                            hole_min_x + clearance,
+                            hole_max_y - clearance - height,
+                        ),
+                        (
+                            hole.centroid.x - width / 2.0,
+                            hole.centroid.y - height / 2.0,
+                        ),
+                    )
 
-                for x, y in hole_candidates:
-                    if (
-                        hole_width + 1e-6 >= width + 2 * clearance
-                        and hole_height + 1e-6 >= height + 2 * clearance
-                        and x >= margin - 1e-6
-                        and y >= margin - 1e-6
-                    ):
-                        candidates.add((round(x, 5), round(y, 5)))
+                    for x, y in hole_positions:
+                        if (
+                            x >= margin - 1e-6
+                            and y >= margin - 1e-6
+                            and x + width <= sheet_width - margin + 1e-6
+                            and y + height <= sheet_height - margin + 1e-6
+                        ):
+                            candidates.add((round(x, 4), round(y, 4)))
 
-        if quality_level >= 2:
-            for x, y in sampled_coordinates(polygon.exterior, maximum=16):
-                possible = (
+        if quality_level >= 2 and len(candidates) < max_candidates:
+            for x, y in sampled_coordinates(
+                polygon.exterior,
+                maximum=10,
+            ):
+                detailed_positions = (
                     (x + clearance, y),
                     (x - clearance - width, y),
                     (x, y + clearance),
                     (x, y - clearance - height),
                 )
 
-                for candidate_x, candidate_y in possible:
+                for candidate_x, candidate_y in detailed_positions:
                     if (
                         candidate_x >= margin - 1e-6
                         and candidate_y >= margin - 1e-6
-                        and candidate_x + width <= sheet_width - margin + 1e-6
-                        and candidate_y + height <= sheet_height - margin + 1e-6
+                        and candidate_x + width
+                        <= sheet_width - margin + 1e-6
+                        and candidate_y + height
+                        <= sheet_height - margin + 1e-6
                     ):
                         candidates.add(
-                            (round(candidate_x, 5), round(candidate_y, 5))
+                            (
+                                round(candidate_x, 4),
+                                round(candidate_y, 4),
+                            )
                         )
 
-    return sorted(candidates, key=lambda position: (position[1], position[0]))
+        if len(candidates) >= max_candidates * 2:
+            break
+
+    ordered = sorted(
+        candidates,
+        key=lambda position: (position[1], position[0]),
+    )
+    return ordered[:max_candidates]
 
 
 def bounds_are_close(
@@ -819,11 +846,15 @@ def fits_on_sheet(
     candidate_bounds = polygon.bounds
 
     for other in placed_polygons:
-        if not bounds_are_close(candidate_bounds, other.bounds, clearance):
+        if not bounds_are_close(
+            candidate_bounds,
+            other.bounds,
+            clearance,
+        ):
             continue
 
-        # Shapely tient compte des trous : une petite pièce entièrement dans
-        # un trou ne coupe pas la matière de la grande pièce.
+        # Les trous sont respectés par Shapely : une pièce entièrement
+        # placée dans un trou ne croise pas la matière de la grande pièce.
         if polygon.intersects(other):
             return False
 
@@ -833,51 +864,28 @@ def fits_on_sheet(
     return True
 
 
-def contact_measure(
-    polygon: Polygon,
-    placed_polygons: list[Polygon],
-    clearance: float,
-) -> float:
-    if not placed_polygons:
-        return 0.0
-
-    search_distance = max(clearance, 0.1) + 0.5
-    buffered = polygon.buffer(search_distance)
-    contact = 0.0
-
-    for other in placed_polygons:
-        if bounds_are_close(polygon.bounds, other.bounds, search_distance):
-            contact += buffered.boundary.intersection(
-                other.buffer(search_distance).boundary
-            ).length
-
-    return contact
-
-
 def placement_score(
     polygon: Polygon,
-    placed_polygons: list[Polygon],
     current_max_x: float,
     current_max_y: float,
-    clearance: float,
 ) -> tuple:
     min_x, min_y, max_x, max_y = polygon.bounds
     new_max_x = max(current_max_x, max_x)
     new_max_y = max(current_max_y, max_y)
-    bbox_area = new_max_x * new_max_y
-    contact = contact_measure(polygon, placed_polygons, clearance)
+    used_rectangle = new_max_x * new_max_y
 
     return (
-        round(new_max_y, 5),
-        round(bbox_area, 3),
-        round(new_max_x, 5),
-        -round(contact, 3),
-        round(min_y, 5),
-        round(min_x, 5),
+        round(new_max_y, 4),
+        round(used_rectangle, 2),
+        round(new_max_x, 4),
+        round(min_y, 4),
+        round(min_x, 4),
     )
 
 
-def expand_piece_copies(pieces: list[DxfPiece]) -> list[tuple[DxfPiece, int]]:
+def expand_piece_copies(
+    pieces: list[DxfPiece],
+) -> list[tuple[DxfPiece, int]]:
     expanded: list[tuple[DxfPiece, int]] = []
 
     for piece in pieces:
@@ -899,27 +907,36 @@ def order_piece_copies(
     elif strategy == 1:
         ordered.sort(
             key=lambda item: (
-                (item[0].polygon.bounds[2] - item[0].polygon.bounds[0])
-                * (item[0].polygon.bounds[3] - item[0].polygon.bounds[1])
+                (
+                    item[0].polygon.bounds[2]
+                    - item[0].polygon.bounds[0]
+                )
+                * (
+                    item[0].polygon.bounds[3]
+                    - item[0].polygon.bounds[1]
+                )
             ),
             reverse=True,
         )
     elif strategy == 2:
         ordered.sort(
             key=lambda item: max(
-                item[0].polygon.bounds[2] - item[0].polygon.bounds[0],
-                item[0].polygon.bounds[3] - item[0].polygon.bounds[1],
+                item[0].polygon.bounds[2]
+                - item[0].polygon.bounds[0],
+                item[0].polygon.bounds[3]
+                - item[0].polygon.bounds[1],
             ),
             reverse=True,
         )
     elif strategy == 3:
         ordered.sort(key=lambda item: item[0].polygon.length, reverse=True)
     elif strategy == 4:
-        # Les pièces avec de grands trous passent d'abord afin que de petites
-        # pièces puissent ensuite être placées à l'intérieur.
         ordered.sort(
             key=lambda item: (
-                sum(Polygon(ring).area for ring in item[0].polygon.interiors),
+                sum(
+                    Polygon(ring).area
+                    for ring in item[0].polygon.interiors
+                ),
                 item[0].polygon.area,
             ),
             reverse=True,
@@ -944,13 +961,260 @@ def compactness_score(
         max_x = max(item.polygon.bounds[2] for item in sheet)
         max_y = max(item.polygon.bounds[3] for item in sheet)
         used_heights.append(max_y - margin)
-        used_areas.append((max_x - margin) * (max_y - margin))
+        used_areas.append(
+            (max_x - margin) * (max_y - margin)
+        )
 
     return (
         len(sheets),
-        round(sum(used_heights), 3),
-        round(sum(used_areas), 3),
+        round(sum(used_heights), 2),
+        round(sum(used_areas), 2),
     )
+
+
+def fallback_shelf_nest(
+    pieces: list[DxfPiece],
+    sheet_width: float,
+    sheet_height: float,
+    margin: float,
+    clearance: float,
+    rotations: list[int],
+    rotation_cache: dict[tuple[str, int], Polygon],
+) -> tuple[list[Placement], list[list[Placement]], list[str]]:
+    """
+    Placement de secours très rapide par rangées.
+
+    Cette solution est calculée avant les essais avancés. Elle garantit
+    qu'un résultat complet reste disponible même si la limite de temps
+    est atteinte pendant l'amélioration.
+    """
+    inner_right = sheet_width - margin
+    inner_top = sheet_height - margin
+    expanded = expand_piece_copies(pieces)
+
+    expanded.sort(
+        key=lambda item: (
+            max(
+                item[0].polygon.bounds[2]
+                - item[0].polygon.bounds[0],
+                item[0].polygon.bounds[3]
+                - item[0].polygon.bounds[1],
+            ),
+            item[0].polygon.area,
+        ),
+        reverse=True,
+    )
+
+    simple_angles = [
+        angle
+        for angle in (0, 90)
+        if angle in rotations
+    ]
+
+    if not simple_angles:
+        simple_angles = [rotations[0]]
+
+    sheets_data: list[dict] = []
+    unplaced: list[str] = []
+
+    for piece, copy_index in expanded:
+        rotated_versions = []
+
+        for angle in simple_angles:
+            cache_key = (piece.reference_key, angle)
+
+            if cache_key not in rotation_cache:
+                rotation_cache[cache_key] = rotated_at_origin(
+                    piece.polygon,
+                    angle,
+                )
+
+            polygon = rotation_cache[cache_key]
+            width = polygon.bounds[2] - polygon.bounds[0]
+            height = polygon.bounds[3] - polygon.bounds[1]
+            rotated_versions.append(
+                (angle, polygon, width, height)
+            )
+
+        best_option = None
+
+        for sheet_index, sheet_data in enumerate(sheets_data):
+            shelves = sheet_data["shelves"]
+
+            for shelf_index, shelf in enumerate(shelves):
+                for angle, polygon, width, height in rotated_versions:
+                    if (
+                        height <= shelf["height"] + 1e-6
+                        and shelf["x"] + width <= inner_right + 1e-6
+                    ):
+                        remaining = inner_right - (shelf["x"] + width)
+                        score = (
+                            0,
+                            remaining,
+                            shelf["y"],
+                            sheet_index,
+                        )
+
+                        if best_option is None or score < best_option[0]:
+                            best_option = (
+                                score,
+                                "existing_shelf",
+                                sheet_index,
+                                shelf_index,
+                                angle,
+                                polygon,
+                                width,
+                                height,
+                            )
+
+            new_shelf_y = (
+                margin
+                if not shelves
+                else max(
+                    shelf["y"] + shelf["height"] + clearance
+                    for shelf in shelves
+                )
+            )
+
+            for angle, polygon, width, height in rotated_versions:
+                if (
+                    margin + width <= inner_right + 1e-6
+                    and new_shelf_y + height <= inner_top + 1e-6
+                ):
+                    score = (
+                        1,
+                        new_shelf_y + height,
+                        width,
+                        sheet_index,
+                    )
+
+                    if best_option is None or score < best_option[0]:
+                        best_option = (
+                            score,
+                            "new_shelf",
+                            sheet_index,
+                            None,
+                            angle,
+                            polygon,
+                            width,
+                            height,
+                        )
+
+        if best_option is None:
+            valid_new_sheet = []
+
+            for angle, polygon, width, height in rotated_versions:
+                if (
+                    margin + width <= inner_right + 1e-6
+                    and margin + height <= inner_top + 1e-6
+                ):
+                    valid_new_sheet.append(
+                        (height, width, angle, polygon)
+                    )
+
+            if not valid_new_sheet:
+                unplaced.append(
+                    f"{piece.reference_display} - copie {copy_index}"
+                )
+                continue
+
+            _, _, angle, polygon = min(valid_new_sheet)
+            width = polygon.bounds[2] - polygon.bounds[0]
+            height = polygon.bounds[3] - polygon.bounds[1]
+            sheet_index = len(sheets_data)
+
+            sheets_data.append(
+                {
+                    "placements": [],
+                    "shelves": [
+                        {
+                            "y": margin,
+                            "height": height,
+                            "x": margin,
+                        }
+                    ],
+                }
+            )
+
+            best_option = (
+                (2, height, width, sheet_index),
+                "existing_shelf",
+                sheet_index,
+                0,
+                angle,
+                polygon,
+                width,
+                height,
+            )
+
+        (
+            _,
+            option_type,
+            sheet_index,
+            shelf_index,
+            angle,
+            polygon,
+            width,
+            height,
+        ) = best_option
+
+        sheet_data = sheets_data[sheet_index]
+
+        if option_type == "new_shelf":
+            shelf_y = (
+                margin
+                if not sheet_data["shelves"]
+                else max(
+                    shelf["y"] + shelf["height"] + clearance
+                    for shelf in sheet_data["shelves"]
+                )
+            )
+
+            sheet_data["shelves"].append(
+                {
+                    "y": shelf_y,
+                    "height": height,
+                    "x": margin,
+                }
+            )
+            shelf_index = len(sheet_data["shelves"]) - 1
+
+        shelf = sheet_data["shelves"][shelf_index]
+        x = shelf["x"]
+        y = shelf["y"]
+        placed_polygon = affinity.translate(
+            polygon,
+            xoff=x,
+            yoff=y,
+        )
+
+        placement = Placement(
+            reference=piece.reference_display,
+            source_name=piece.source_name,
+            sheet_index=sheet_index,
+            rotation=angle,
+            polygon=placed_polygon,
+            original_polygon=piece.polygon,
+            copy_index=copy_index,
+            thickness=piece.thickness,
+            material=piece.material,
+        )
+
+        sheet_data["placements"].append(placement)
+        shelf["x"] = x + width + clearance
+        shelf["height"] = max(shelf["height"], height)
+
+    sheets = [
+        sheet_data["placements"]
+        for sheet_data in sheets_data
+    ]
+    placements = [
+        item
+        for sheet in sheets
+        for item in sheet
+    ]
+
+    return placements, sheets, unplaced
 
 
 def nest_one_order(
@@ -962,9 +1226,16 @@ def nest_one_order(
     rotations: list[int],
     allow_hole_nesting: bool,
     quality_level: int,
+    max_candidates: int,
     rotation_cache: dict[tuple[str, int], Polygon],
+    deadline: float,
     item_progress_callback=None,
-) -> tuple[list[Placement], list[list[Placement]], list[str]]:
+) -> tuple[
+    list[Placement],
+    list[list[Placement]],
+    list[str],
+    bool,
+]:
     sheet_inner = box(
         margin,
         margin,
@@ -977,36 +1248,64 @@ def nest_one_order(
     unplaced: list[str] = []
     total = len(ordered_pieces)
 
-    for item_index, (piece, copy_index) in enumerate(ordered_pieces, start=1):
+    for item_index, (piece, copy_index) in enumerate(
+        ordered_pieces,
+        start=1,
+    ):
+        if time.perf_counter() >= deadline:
+            return [], [], [], True
+
         rotated_versions: list[tuple[int, Polygon]] = []
 
         for angle in rotations:
             cache_key = (piece.reference_key, angle)
+
             if cache_key not in rotation_cache:
                 rotation_cache[cache_key] = rotated_at_origin(
                     piece.polygon,
                     angle,
                 )
-            rotated_versions.append((angle, rotation_cache[cache_key]))
+
+            rotated_versions.append(
+                (angle, rotation_cache[cache_key])
+            )
 
         best_global = None
 
         for sheet_index, sheet_placements in enumerate(sheets):
-            current_polygons = [item.polygon for item in sheet_placements]
+            if time.perf_counter() >= deadline:
+                return [], [], [], True
+
+            current_polygons = [
+                item.polygon
+                for item in sheet_placements
+            ]
             current_max_x = max(
-                (polygon.bounds[2] for polygon in current_polygons),
+                (
+                    polygon.bounds[2]
+                    for polygon in current_polygons
+                ),
                 default=margin,
             )
             current_max_y = max(
-                (polygon.bounds[3] for polygon in current_polygons),
+                (
+                    polygon.bounds[3]
+                    for polygon in current_polygons
+                ),
                 default=margin,
             )
 
             for angle, rotated in rotated_versions:
+                if time.perf_counter() >= deadline:
+                    return [], [], [], True
+
                 width = rotated.bounds[2] - rotated.bounds[0]
                 height = rotated.bounds[3] - rotated.bounds[1]
 
-                if width > inner_width + 1e-6 or height > inner_height + 1e-6:
+                if (
+                    width > inner_width + 1e-6
+                    or height > inner_height + 1e-6
+                ):
                     continue
 
                 positions = candidate_positions(
@@ -1018,10 +1317,18 @@ def nest_one_order(
                     sheet_height,
                     allow_hole_nesting,
                     quality_level,
+                    max_candidates,
                 )
 
                 for x, y in positions:
-                    candidate = affinity.translate(rotated, xoff=x, yoff=y)
+                    if time.perf_counter() >= deadline:
+                        return [], [], [], True
+
+                    candidate = affinity.translate(
+                        rotated,
+                        xoff=x,
+                        yoff=y,
+                    )
 
                     if not fits_on_sheet(
                         candidate,
@@ -1033,14 +1340,20 @@ def nest_one_order(
 
                     local_score = placement_score(
                         candidate,
-                        current_polygons,
                         current_max_x,
                         current_max_y,
-                        clearance,
                     )
-                    global_score = local_score + (sheet_index,)
+                    global_score = (
+                        local_score[0],
+                        local_score[1],
+                        sheet_index,
+                        *local_score[2:],
+                    )
 
-                    if best_global is None or global_score < best_global[0]:
+                    if (
+                        best_global is None
+                        or global_score < best_global[0]
+                    ):
                         best_global = (
                             global_score,
                             sheet_index,
@@ -1070,7 +1383,10 @@ def nest_one_order(
                 width = rotated.bounds[2] - rotated.bounds[0]
                 height = rotated.bounds[3] - rotated.bounds[1]
 
-                if width > inner_width + 1e-6 or height > inner_height + 1e-6:
+                if (
+                    width > inner_width + 1e-6
+                    or height > inner_height + 1e-6
+                ):
                     continue
 
                 candidate = affinity.translate(
@@ -1081,14 +1397,24 @@ def nest_one_order(
 
                 if sheet_inner.covers(candidate):
                     score = (
-                        round(candidate.bounds[3], 5),
-                        round(candidate.bounds[2], 5),
+                        round(candidate.bounds[3], 4),
+                        round(candidate.bounds[2], 4),
                     )
-                    if best_new_sheet is None or score < best_new_sheet[0]:
-                        best_new_sheet = (score, angle, candidate)
+
+                    if (
+                        best_new_sheet is None
+                        or score < best_new_sheet[0]
+                    ):
+                        best_new_sheet = (
+                            score,
+                            angle,
+                            candidate,
+                        )
 
             if best_new_sheet is None:
-                unplaced.append(f"{piece.reference_display} - copie {copy_index}")
+                unplaced.append(
+                    f"{piece.reference_display} - copie {copy_index}"
+                )
             else:
                 _, angle, candidate = best_new_sheet
                 sheet_index = len(sheets)
@@ -1111,8 +1437,13 @@ def nest_one_order(
         if item_progress_callback is not None and total:
             item_progress_callback(item_index / total)
 
-    placements = [item for sheet in sheets for item in sheet]
-    return placements, sheets, unplaced
+    placements = [
+        item
+        for sheet in sheets
+        for item in sheet
+    ]
+
+    return placements, sheets, unplaced, False
 
 
 def nest_pieces(
@@ -1124,62 +1455,169 @@ def nest_pieces(
     rotations: list[int],
     quality_mode: str = "Équilibré",
     allow_hole_nesting: bool = True,
+    time_budget_seconds: float = 40.0,
     progress_callback=None,
 ) -> tuple[list[Placement], int, list[str]]:
+    """
+    Calcule d'abord une solution complète et rapide, puis tente de
+    l'améliorer jusqu'à la limite de temps.
+
+    Une solution est donc toujours renvoyée, même lorsque le calcul avancé
+    est interrompu par le chronomètre.
+    """
     if sheet_width <= 0 or sheet_height <= 0:
-        raise ValueError("Les dimensions de la tôle doivent être positives.")
+        raise ValueError(
+            "Les dimensions de la tôle doivent être positives."
+        )
 
     if margin < 0 or clearance < 0:
-        raise ValueError("La marge et l'espacement ne peuvent pas être négatifs.")
+        raise ValueError(
+            "La marge et l'espacement ne peuvent pas être négatifs."
+        )
 
-    if sheet_width - 2 * margin <= 0 or sheet_height - 2 * margin <= 0:
-        raise ValueError("La marge est trop grande pour le format de tôle.")
+    if (
+        sheet_width - 2 * margin <= 0
+        or sheet_height - 2 * margin <= 0
+    ):
+        raise ValueError(
+            "La marge est trop grande pour le format de tôle."
+        )
+
+    if not rotations:
+        rotations = [0]
+
+    expanded = expand_piece_copies(pieces)
+    total_copies = len(expanded)
+    rotation_cache: dict[tuple[str, int], Polygon] = {}
+
+    # Réduction automatique de la complexité pour les gros projets.
+    effective_rotations = sorted(set(rotations))
+
+    if total_copies > 120:
+        effective_rotations = [
+            angle
+            for angle in (0, 90)
+            if angle in effective_rotations
+        ] or [effective_rotations[0]]
+    elif total_copies > 60 and len(effective_rotations) > 4:
+        effective_rotations = [
+            angle
+            for angle in (0, 90, 180, 270)
+            if angle in effective_rotations
+        ] or effective_rotations[:4]
 
     quality_settings = {
-        "Rapide": (2, 1),
-        "Équilibré": (6, 2),
-        "Approfondi": (14, 2),
+        "Rapide": (1, 1, 35),
+        "Équilibré": (3, 1, 65),
+        "Approfondi": (6, 2, 100),
     }
-    attempts, quality_level = quality_settings.get(quality_mode, (6, 2))
-    expanded = expand_piece_copies(pieces)
-    rotation_cache: dict[tuple[str, int], Polygon] = {}
-    best_result = None
+
+    attempts, quality_level, max_candidates = quality_settings.get(
+        quality_mode,
+        (3, 1, 65),
+    )
+
+    if total_copies > 150:
+        attempts = 1
+        quality_level = 1
+        max_candidates = 25
+    elif total_copies > 80:
+        attempts = min(attempts, 2)
+        quality_level = 1
+        max_candidates = min(max_candidates, 45)
+    elif total_copies > 40:
+        attempts = min(attempts, 3)
+        max_candidates = min(max_candidates, 65)
+
+    # 1. Solution de secours complète et immédiate.
+    fallback_placements, fallback_sheets, fallback_unplaced = (
+        fallback_shelf_nest(
+            pieces,
+            sheet_width,
+            sheet_height,
+            margin,
+            clearance,
+            effective_rotations,
+            rotation_cache,
+        )
+    )
+
+    best_result = (
+        (
+            len(fallback_unplaced),
+            *compactness_score(fallback_sheets, margin),
+        ),
+        fallback_placements,
+        fallback_sheets,
+        fallback_unplaced,
+    )
+
+    if progress_callback is not None:
+        progress_callback(0.08)
+
+    # 2. Recherche d'améliorations dans un temps strictement limité.
+    start_time = time.perf_counter()
+    deadline = start_time + max(5.0, float(time_budget_seconds))
 
     for attempt_index in range(attempts):
-        ordered = order_piece_copies(expanded, attempt_index)
+        if time.perf_counter() >= deadline:
+            break
+
+        ordered = order_piece_copies(
+            expanded,
+            attempt_index,
+        )
 
         def update_item_progress(item_fraction):
             if progress_callback is not None:
-                progress_callback(
-                    (attempt_index + item_fraction) / attempts
+                fraction = (
+                    0.08
+                    + 0.90
+                    * (
+                        attempt_index + item_fraction
+                    )
+                    / max(1, attempts)
                 )
+                progress_callback(min(0.98, fraction))
 
-        placements, sheets, unplaced = nest_one_order(
+        placements, sheets, unplaced, timed_out = nest_one_order(
             ordered,
             sheet_width,
             sheet_height,
             margin,
             clearance,
-            rotations,
+            effective_rotations,
             allow_hole_nesting,
             quality_level,
+            max_candidates,
             rotation_cache,
+            deadline,
             item_progress_callback=update_item_progress,
         )
+
+        if timed_out:
+            break
 
         score = (
             len(unplaced),
             *compactness_score(sheets, margin),
         )
 
-        if best_result is None or score < best_result[0]:
-            best_result = (score, placements, sheets, unplaced)
+        if score < best_result[0]:
+            best_result = (
+                score,
+                placements,
+                sheets,
+                unplaced,
+            )
 
-        if progress_callback is not None:
-            progress_callback((attempt_index + 1) / attempts)
+        # Une seule tôle sans pièce manquante ne peut pas être améliorée
+        # sur le critère principal du nombre de tôles.
+        if not unplaced and len(sheets) <= 1:
+            break
 
-    if best_result is None:
-        return [], 0, []
+    if progress_callback is not None:
+        progress_callback(1.0)
 
     _, placements, sheets, unplaced = best_result
     return placements, len(sheets), unplaced
@@ -1366,7 +1804,7 @@ st.set_page_config(
     layout="wide",
 )
 
-st.title("📐 OptiTôle Pro v7 Advanced")
+st.title("📐 OptiTôle Pro v8 Stable")
 st.caption(
     "Nesting de tôles à partir de DXF Advance Steel et d'une nomenclature Excel/CSV. "
     "Version 7 : trous réels, placement dans les trous et optimisation multi-essais."
@@ -1406,7 +1844,7 @@ with st.sidebar:
     tolerance = st.number_input(
         "Précision des courbes DXF (mm)",
         min_value=0.1,
-        value=3.0,
+        value=2.0,
         step=0.5,
         help=(
             "3 mm est conseillé pour un premier calcul rapide. "
@@ -1436,13 +1874,28 @@ with st.sidebar:
         ),
     )
 
+    time_budget_seconds = st.select_slider(
+        "Temps maximum d'amélioration par projet (secondes)",
+        options=[15, 30, 45, 60, 90],
+        value=45,
+        help=(
+            "Une première solution complète est créée immédiatement. "
+            "Le moteur utilise ensuite ce temps pour essayer de l'améliorer."
+        ),
+    )
+
     allow_hole_nesting = st.checkbox(
         "Autoriser les petites pièces dans les grands trous",
         value=True,
     )
 
+    st.info(
+        "La v8 crée d'abord une répartition de secours complète, "
+        "puis améliore cette solution pendant le temps choisi."
+    )
+
     st.warning(
-        "Ce moteur est une version MVP heuristique. "
+        "Ce moteur reste un MVP heuristique. "
         "Vérifie toujours le DXF exporté avant une découpe réelle."
     )
 
@@ -1509,6 +1962,9 @@ if run_button:
         group_reports = []
         unplaced_messages = []
         export_files = io.BytesIO()
+        total_project_copies = sum(
+            piece.quantity for piece in pieces
+        )
 
         with zipfile.ZipFile(
             export_files,
@@ -1535,6 +1991,13 @@ if run_button:
                         min(100, max(0, int(value * 100)))
                     )
 
+                group_time_budget = max(
+                    5.0,
+                    float(time_budget_seconds)
+                    * total_group_copies
+                    / max(1, total_project_copies),
+                )
+
                 placements, sheet_count, unplaced = nest_pieces(
                     group_pieces,
                     sheet_width,
@@ -1544,6 +2007,7 @@ if run_button:
                     sorted(rotation_options),
                     quality_mode=quality_mode,
                     allow_hole_nesting=allow_hole_nesting,
+                    time_budget_seconds=group_time_budget,
                     progress_callback=update_group_progress,
                 )
 
@@ -1646,6 +2110,7 @@ if run_button:
             "missing": missing,
             "unused": unused,
             "unplaced_messages": unplaced_messages,
+            "time_budget_seconds": time_budget_seconds,
         }
 
     except Exception as exc:
