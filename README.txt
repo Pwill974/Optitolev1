@@ -1,6 +1,10 @@
-OptiTôle Pro MVP v3
+OptiTôle Pro v7 Advanced
 
-Correction des noms Advance Steel :
-- 13.nc.dxf est reconnu comme 13
-- AT1.nc.dxf est reconnu comme AT1
-- AT1.nc.err.dxf est reconnu comme AT1
+- Reconstruction des contours LINE/ARC avec ezdxf EdgeMiner.
+- Détection et conservation des trous.
+- Aperçu avec trous réellement évidés.
+- Placement possible de petites pièces dans les grands trous.
+- Optimisation multi-essais avec plusieurs ordres de pièces.
+- Rotations par pas de 90°, 45°, 30° ou 15°.
+
+Limite : ce moteur reste heuristique et ne remplace pas encore un moteur industriel NFP/algorithme génétique tel qu’OptiNest.
