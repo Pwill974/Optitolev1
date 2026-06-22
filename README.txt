@@ -1,10 +1,11 @@
-OptiTôle Pro v7 Advanced
+OptiTôle Pro v8 Stable
 
-- Reconstruction des contours LINE/ARC avec ezdxf EdgeMiner.
-- Détection et conservation des trous.
-- Aperçu avec trous réellement évidés.
-- Placement possible de petites pièces dans les grands trous.
-- Optimisation multi-essais avec plusieurs ordres de pièces.
-- Rotations par pas de 90°, 45°, 30° ou 15°.
+Principales corrections :
+- solution de secours complète créée avant l'optimisation avancée ;
+- durée maximale réglable ;
+- meilleure solution conservée automatiquement ;
+- limitation du nombre de positions testées ;
+- réduction automatique des rotations pour les gros projets ;
+- conservation des trous et placement possible dans les ouvertures.
 
-Limite : ce moteur reste heuristique et ne remplace pas encore un moteur industriel NFP/algorithme génétique tel qu’OptiNest.
+Le résultat doit toujours être contrôlé avant une découpe réelle.
