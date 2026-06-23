@@ -363,19 +363,63 @@ def clean_ring(points: list[tuple[float, float]]) -> list[tuple[float, float]]:
 
 
 def entity_is_closed(entity) -> bool:
+    """
+    Détecte les contours réellement fermés, même lorsque le drapeau DXF
+    « closed » est faux.
+
+    Advance Steel exporte notamment certains trous circulaires sous forme
+    de LWPOLYLINE annoncées ouvertes, mais composées de deux arcs avec un
+    point final identique au point initial. ezdxf reconnaît alors le chemin
+    comme fermé : il faut donc tester la géométrie et pas seulement le drapeau.
+    """
     entity_type = entity.dxftype()
 
     if entity_type == "LWPOLYLINE":
-        return bool(entity.closed)
+        if bool(entity.closed):
+            return True
+
+        try:
+            path = make_path(entity)
+            if path.is_closed:
+                return True
+        except Exception:
+            pass
+
+        try:
+            points = list(entity.get_points("xy"))
+            if len(points) >= 3:
+                first_x, first_y = points[0]
+                last_x, last_y = points[-1]
+                return math.hypot(
+                    float(first_x) - float(last_x),
+                    float(first_y) - float(last_y),
+                ) <= 0.05
+        except Exception:
+            return False
+
+        return False
 
     if entity_type == "POLYLINE":
-        return bool(entity.is_closed)
+        if bool(entity.is_closed):
+            return True
+
+        try:
+            path = make_path(entity)
+            return bool(path.is_closed)
+        except Exception:
+            return False
 
     if entity_type in {"CIRCLE", "ELLIPSE"}:
         return True
 
     if entity_type == "SPLINE":
-        return bool(getattr(entity, "closed", False))
+        if bool(getattr(entity, "closed", False)):
+            return True
+
+        try:
+            return bool(make_path(entity).is_closed)
+        except Exception:
+            return False
 
     return False
 
@@ -2015,7 +2059,7 @@ st.set_page_config(
     layout="wide",
 )
 
-st.title("📐 OptiTôle Pro v9 Compact")
+st.title("📐 OptiTôle Pro v10 — Trous Advance Steel")
 st.caption(
     "Nesting de tôles à partir de DXF Advance Steel et d'une nomenclature Excel/CSV. "
     "Version 9 : lecture des blocs DXF, diagnostic des trous et compactage amélioré."
