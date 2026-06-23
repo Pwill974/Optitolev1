@@ -1,9 +1,8 @@
-OptiTôle Pro v9 Compact
+OptiTôle Pro v10 — Trous Advance Steel
 
-- lecture récursive des INSERT/blocs DXF ;
-- tableau de diagnostic des trous détectés ;
-- alignement de sommets pour mieux emboîter les formes ;
-- compactage gauche/bas ;
-- tentative de vider les dernières tôles.
+Correction validée sur le fichier réel 52.nc.dxf fourni :
+- contour extérieur détecté ;
+- 4 trous circulaires détectés ;
+- les trous sont exportés et affichés comme ouvertures.
 
-Limite : ce moteur heuristique n'est pas un clone industriel d'OptiNest.
+Après la mise à jour, cliquez sur « Effacer les anciens résultats » avant de relancer le calcul.
