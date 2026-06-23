@@ -1,11 +1,9 @@
-OptiTôle Pro v8 Stable
+OptiTôle Pro v9 Compact
 
-Principales corrections :
-- solution de secours complète créée avant l'optimisation avancée ;
-- durée maximale réglable ;
-- meilleure solution conservée automatiquement ;
-- limitation du nombre de positions testées ;
-- réduction automatique des rotations pour les gros projets ;
-- conservation des trous et placement possible dans les ouvertures.
+- lecture récursive des INSERT/blocs DXF ;
+- tableau de diagnostic des trous détectés ;
+- alignement de sommets pour mieux emboîter les formes ;
+- compactage gauche/bas ;
+- tentative de vider les dernières tôles.
 
-Le résultat doit toujours être contrôlé avant une découpe réelle.
+Limite : ce moteur heuristique n'est pas un clone industriel d'OptiNest.
