@@ -1,8 +1,14 @@
-OptiTôle Pro v10 — Trous Advance Steel
+OptiTôle Pro v12 — Optimisation universelle
 
-Correction validée sur le fichier réel 52.nc.dxf fourni :
-- contour extérieur détecté ;
-- 4 trous circulaires détectés ;
-- les trous sont exportés et affichés comme ouvertures.
+Cette version ne privilégie aucune épaisseur.
 
-Après la mise à jour, cliquez sur « Effacer les anciens résultats » avant de relancer le calcul.
+Améliorations :
+- mode Maximum valable pour toutes les épaisseurs ;
+- temps réparti selon la quantité et la complexité géométrique ;
+- jusqu'à 30 ordres de placement testés ;
+- alignement bord-à-bord et compactage directionnel ;
+- fusion des tôles peu remplies ;
+- tentative de regrouper 3 tôles en 2 et 4 tôles en 3 ;
+- trous Advance Steel conservés.
+
+Important : un optimum mathématique absolu n'est pas garanti. Contrôler les DXF avant découpe.
