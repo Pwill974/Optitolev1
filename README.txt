@@ -1,14 +1,21 @@
-OptiTôle Pro v12 — Optimisation universelle
+OptiTôle Pro v14 — Dense Nesting Pro
+====================================
 
-Cette version ne privilégie aucune épaisseur.
-
-Améliorations :
-- mode Maximum valable pour toutes les épaisseurs ;
-- temps réparti selon la quantité et la complexité géométrique ;
-- jusqu'à 30 ordres de placement testés ;
-- alignement bord-à-bord et compactage directionnel ;
-- fusion des tôles peu remplies ;
-- tentative de regrouper 3 tôles en 2 et 4 tôles en 3 ;
+Nouveautés :
+- conservation du stock disponible de la v13 ;
+- rotations selon les angles réels des pièces ;
+- mode qualité Pro dense ;
+- recherche renforcée des positions contre les bords, sommets et arêtes ;
+- meilleur remplissage des coins et des vides ;
+- plus de stratégies de classement des pièces ;
 - trous Advance Steel conservés.
 
-Important : un optimum mathématique absolu n'est pas garanti. Contrôler les DXF avant découpe.
+Réglage recommandé :
+- Qualité : Pro dense
+- Pas de rotation : 45°
+- Rotations selon les angles réels : activé
+- Densité de recherche : 2.0 ou 3.0
+- Temps global : 300 à 900 secondes
+- Placement dans les trous : activé
+
+Le résultat doit être contrôlé avant toute découpe réelle.
