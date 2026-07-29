@@ -737,6 +737,100 @@ def build_pieces(
 # Moteur de nesting heuristique
 # ============================================================
 
+
+# ============================================================
+# V14 — Rotations naturelles et moteur dense
+# ============================================================
+
+USE_NATURAL_EDGE_ANGLES = True
+MAX_NATURAL_ROTATIONS = 36
+DENSE_CANDIDATE_MULTIPLIER = 1.0
+
+
+def normalize_angle(angle: float) -> float:
+    value = float(angle) % 360.0
+    if abs(value - round(value)) < 1e-6:
+        return float(int(round(value)) % 360)
+    return round(value, 3)
+
+
+def unique_angles(angles: list[float], tolerance: float = 0.25) -> list[float]:
+    result: list[float] = []
+
+    for angle in angles:
+        candidate = normalize_angle(angle)
+        if not any(
+            abs(((candidate - existing + 180.0) % 360.0) - 180.0) <= tolerance
+            for existing in result
+        ):
+            result.append(candidate)
+
+    return result
+
+
+def dominant_edge_angles(polygon: Polygon, limit: int = 8) -> list[float]:
+    segments = []
+    coords = list(polygon.exterior.coords)
+
+    for index in range(len(coords) - 1):
+        x1, y1 = coords[index]
+        x2, y2 = coords[index + 1]
+        length = math.hypot(x2 - x1, y2 - y1)
+
+        if length < 10.0:
+            continue
+
+        angle = math.degrees(math.atan2(y2 - y1, x2 - x1)) % 180.0
+        segments.append((length, round(angle, 3)))
+
+    segments.sort(reverse=True)
+    angles = []
+
+    for _, angle in segments:
+        if not any(abs(angle - existing) <= 1.0 for existing in angles):
+            angles.append(angle)
+        if len(angles) >= limit:
+            break
+
+    return angles
+
+
+def piece_rotation_angles(piece: DxfPiece, base_rotations: list[float]) -> list[float]:
+    angles = [float(angle) for angle in base_rotations]
+
+    if USE_NATURAL_EDGE_ANGLES:
+        for edge_angle in dominant_edge_angles(piece.polygon):
+            angles.extend(
+                [
+                    -edge_angle,
+                    90.0 - edge_angle,
+                    180.0 - edge_angle,
+                    270.0 - edge_angle,
+                ]
+            )
+
+    angles = unique_angles(angles)
+
+    if len(angles) > MAX_NATURAL_ROTATIONS:
+        base = unique_angles([float(angle) for angle in base_rotations])
+        extra = [angle for angle in angles if angle not in base]
+        angles = base + extra[: max(0, MAX_NATURAL_ROTATIONS - len(base))]
+
+    return angles
+
+
+def piece_like_from_placement(item: Placement) -> DxfPiece:
+    return DxfPiece(
+        reference_display=item.reference,
+        reference_key=normalize_reference(item.reference),
+        source_name=item.source_name,
+        polygon=item.original_polygon,
+        quantity=1,
+        thickness=item.thickness,
+        material=item.material,
+    )
+
+
 def rotated_at_origin(polygon: Polygon, angle: int) -> Polygon:
     rotated = affinity.rotate(
         polygon,
@@ -803,7 +897,15 @@ def candidate_positions(
     """
     width = rotated_piece.bounds[2] - rotated_piece.bounds[0]
     height = rotated_piece.bounds[3] - rotated_piece.bounds[1]
-    candidates = {(round(margin, 4), round(margin, 4))}
+    candidates = {
+        (round(margin, 4), round(margin, 4)),
+        (round(sheet_width - margin - width, 4), round(margin, 4)),
+        (round(margin, 4), round(sheet_height - margin - height, 4)),
+        (
+            round(sheet_width - margin - width, 4),
+            round(sheet_height - margin - height, 4),
+        ),
+    }
 
     moving_vertices = sampled_coordinates(
         rotated_piece.exterior,
@@ -832,8 +934,19 @@ def candidate_positions(
             (min_x, max_y + clearance),
             (margin, max_y + clearance),
             (max_x + clearance, max_y + clearance),
+
             (min_x - clearance - width, min_y),
+            (min_x - clearance - width, margin),
             (min_x, min_y - clearance - height),
+            (margin, min_y - clearance - height),
+
+            (max_x + clearance, max_y - height),
+            (min_x - clearance - width, max_y - height),
+            (max_x - width, max_y + clearance),
+            (max_x - width, min_y - clearance - height),
+
+            (sheet_width - margin - width, min_y),
+            (min_x, sheet_height - margin - height),
         ):
             add_candidate(x, y)
 
@@ -953,10 +1066,12 @@ def candidate_positions(
         ),
     )
 
+    max_candidates = max(20, int(max_candidates * DENSE_CANDIDATE_MULTIPLIER))
+
     if len(ordered) <= max_candidates:
         return ordered
 
-    primary_count = max(1, int(max_candidates * 0.75))
+    primary_count = max(1, int(max_candidates * 0.70))
     primary = ordered[:primary_count]
     remaining = ordered[primary_count:]
     extra_count = max_candidates - primary_count
@@ -1138,15 +1253,26 @@ def placement_score(
         clearance,
     )
 
+    center_x = (min_x + max_x) / 2.0
+    center_y = (min_y + max_y) / 2.0
+    sheet_min_x, sheet_min_y, sheet_max_x, sheet_max_y = sheet_inner.bounds
+    distance_to_edges = min(
+        abs(min_x - sheet_min_x),
+        abs(min_y - sheet_min_y),
+        abs(sheet_max_x - max_x),
+        abs(sheet_max_y - max_y),
+    )
+
     return (
         round(waste_ratio, 7),
         round(waste, 1),
+        -contacts * 3,
+        round(distance_to_edges, 2),
         round(envelope_area, 1),
-        -contacts,
         round(new_max_y, 3),
         round(new_max_x, 3),
-        round(min_y, 3),
-        round(min_x, 3),
+        round(center_y, 3),
+        round(center_x, 3),
     )
 
 
@@ -1167,7 +1293,7 @@ def order_piece_copies(
     attempt_index: int,
 ) -> list[tuple[DxfPiece, int]]:
     ordered = list(expanded)
-    strategy = attempt_index % 10
+    strategy = attempt_index % 16
 
     def bbox_area(item):
         polygon = item[0].polygon
@@ -1221,6 +1347,60 @@ def order_piece_copies(
                 mixed.append(ordered[right])
                 right -= 1
         ordered = mixed
+    elif strategy == 8:
+        ordered.sort(
+            key=lambda item: (
+                max_dimension(item),
+                item[0].polygon.area,
+            ),
+            reverse=True,
+        )
+    elif strategy == 9:
+        ordered.sort(
+            key=lambda item: (
+                concavity(item),
+                item[0].polygon.area,
+            ),
+            reverse=True,
+        )
+    elif strategy == 10:
+        ordered.sort(
+            key=lambda item: (
+                len(item[0].polygon.interiors),
+                item[0].polygon.area,
+            ),
+            reverse=True,
+        )
+    elif strategy == 11:
+        ordered.sort(key=lambda item: item[0].polygon.area)
+    elif strategy == 12:
+        big = sorted(ordered, key=lambda item: item[0].polygon.area, reverse=True)
+        small = sorted(ordered, key=lambda item: item[0].polygon.area)
+        mixed = []
+        while big or small:
+            if big:
+                candidate = big.pop(0)
+                if candidate not in mixed:
+                    mixed.append(candidate)
+            if small:
+                candidate = small.pop(0)
+                if candidate not in mixed:
+                    mixed.append(candidate)
+        ordered = mixed
+    elif strategy == 13:
+        ordered.sort(
+            key=lambda item: (
+                round(max_dimension(item) / max(1.0, min(
+                    item[0].polygon.bounds[2] - item[0].polygon.bounds[0],
+                    item[0].polygon.bounds[3] - item[0].polygon.bounds[1],
+                )), 3),
+                item[0].polygon.area,
+            ),
+            reverse=True,
+        )
+    elif strategy == 14:
+        random.Random(2000 + attempt_index * 41).shuffle(ordered)
+        ordered.sort(key=lambda item: item[0].polygon.area, reverse=True)
     else:
         random.Random(1000 + attempt_index * 37).shuffle(ordered)
 
@@ -1400,7 +1580,7 @@ def nest_one_order(
             return [], [], [], True
 
         versions = []
-        for angle in rotations:
+        for angle in piece_rotation_angles(piece, rotations):
             cache_key = (piece.reference_key, angle)
             if cache_key not in rotation_cache:
                 rotation_cache[cache_key] = rotated_at_origin(piece.polygon, angle)
@@ -1561,7 +1741,8 @@ def try_insert_item(
         current_max_y = max((p.bounds[3] for p in fixed), default=margin)
         current_area = sum(p.area for p in fixed)
 
-        for angle in rotations:
+        item_piece = piece_like_from_placement(item)
+        for angle in piece_rotation_angles(item_piece, rotations):
             cache_key = (reference_key, angle)
             if cache_key not in rotation_cache:
                 rotation_cache[cache_key] = rotated_at_origin(item.original_polygon, angle)
@@ -2074,6 +2255,1410 @@ def nest_pieces(
 
 
 # ============================================================
+# V13 — Stock de tôles à dimensions variables
+# ============================================================
+
+@dataclass
+class StockSheet:
+    instance_id: str
+    row_id: int
+    stock_id: str
+    material: str
+    thickness: str
+    width: float
+    height: float
+    stock_type: str
+    priority: int
+
+
+@dataclass
+class SheetMeta:
+    sheet_index: int
+    sheet_id: str
+    material: str
+    thickness: str
+    width: float
+    height: float
+    source: str
+    stock_type: str
+    stock_row_id: int | None
+    priority: int
+
+
+STOCK_COLUMNS = [
+    "Utiliser",
+    "ID stock",
+    "Matière",
+    "Épaisseur",
+    "Largeur (mm)",
+    "Hauteur (mm)",
+    "Quantité",
+    "Type",
+    "Priorité",
+]
+
+
+def default_stock_dataframe(
+    default_width: float = 3000.0,
+    default_height: float = 1500.0,
+) -> pd.DataFrame:
+    return pd.DataFrame(
+        [
+            {
+                "Utiliser": True,
+                "ID stock": "STOCK-001",
+                "Matière": "S235JR",
+                "Épaisseur": "5",
+                "Largeur (mm)": float(default_width),
+                "Hauteur (mm)": float(default_height),
+                "Quantité": 1,
+                "Type": "Tôle complète",
+                "Priorité": 10,
+            }
+        ],
+        columns=STOCK_COLUMNS,
+    )
+
+
+def ensure_stock_columns(dataframe: pd.DataFrame) -> pd.DataFrame:
+    result = dataframe.copy()
+
+    defaults = {
+        "Utiliser": True,
+        "ID stock": "",
+        "Matière": "",
+        "Épaisseur": "",
+        "Largeur (mm)": 3000.0,
+        "Hauteur (mm)": 1500.0,
+        "Quantité": 1,
+        "Type": "Tôle complète",
+        "Priorité": 10,
+    }
+
+    for column in STOCK_COLUMNS:
+        if column not in result.columns:
+            result[column] = defaults[column]
+
+    return result[STOCK_COLUMNS]
+
+
+def read_stock_csv(uploaded_file) -> pd.DataFrame:
+    raw = uploaded_file.getvalue()
+    decoded = None
+
+    for encoding in ("utf-8-sig", "cp1252", "latin-1"):
+        try:
+            decoded = raw.decode(encoding)
+            break
+        except UnicodeDecodeError:
+            continue
+
+    if decoded is None:
+        raise ValueError("Impossible de lire le CSV de stock.")
+
+    try:
+        dataframe = pd.read_csv(
+            io.StringIO(decoded),
+            sep=None,
+            engine="python",
+        )
+    except Exception as exc:
+        raise ValueError(
+            "Le CSV de stock est illisible. "
+            "Utilise un séparateur point-virgule ou virgule."
+        ) from exc
+
+    return ensure_stock_columns(dataframe)
+
+
+def material_key(value: object) -> str:
+    text = remove_accents(cell_to_text(value)).upper()
+    return re.sub(r"[^A-Z0-9*]+", "", text)
+
+
+def thickness_number(value: object) -> float | None:
+    text = cell_to_text(value).replace(",", ".")
+    match = re.search(r"-?\d+(?:\.\d+)?", text)
+
+    if not match:
+        return None
+
+    try:
+        return float(match.group(0))
+    except ValueError:
+        return None
+
+
+def thickness_key(value: object) -> str:
+    number = thickness_number(value)
+
+    if number is not None:
+        return f"{number:.4f}"
+
+    return normalize_reference(value)
+
+
+def stock_matches_group(
+    stock_sheet: StockSheet,
+    material: str,
+    thickness: str,
+) -> bool:
+    stock_material = material_key(stock_sheet.material)
+    group_material = material_key(material)
+
+    wildcard_materials = {"*", "TOUTES", "TOUS", "ALL"}
+    unknown_materials = {"", "NONRENSEIGNEE", "INCONNUE"}
+
+    if stock_material in wildcard_materials:
+        material_match = True
+    elif group_material in unknown_materials:
+        material_match = stock_material in unknown_materials
+    else:
+        material_match = stock_material == group_material
+
+    stock_thickness_number = thickness_number(stock_sheet.thickness)
+    group_thickness_number = thickness_number(thickness)
+
+    if (
+        stock_thickness_number is not None
+        and group_thickness_number is not None
+    ):
+        thickness_match = (
+            abs(stock_thickness_number - group_thickness_number) <= 0.01
+        )
+    else:
+        thickness_match = (
+            thickness_key(stock_sheet.thickness)
+            == thickness_key(thickness)
+        )
+
+    return material_match and thickness_match
+
+
+def prepare_stock_instances(
+    stock_dataframe: pd.DataFrame,
+) -> list[StockSheet]:
+    dataframe = ensure_stock_columns(stock_dataframe)
+    instances: list[StockSheet] = []
+
+    for row_id, row in dataframe.reset_index(drop=True).iterrows():
+        use_value = row.get("Utiliser", True)
+
+        if isinstance(use_value, str):
+            enabled = use_value.strip().lower() not in {
+                "non",
+                "false",
+                "0",
+                "désactivé",
+                "desactive",
+            }
+        else:
+            enabled = bool(use_value)
+
+        if not enabled:
+            continue
+
+        try:
+            width = float(str(row["Largeur (mm)"]).replace(",", "."))
+            height = float(str(row["Hauteur (mm)"]).replace(",", "."))
+            quantity = int(float(str(row["Quantité"]).replace(",", ".")))
+            priority = int(float(str(row["Priorité"]).replace(",", ".")))
+        except (TypeError, ValueError) as exc:
+            raise ValueError(
+                f"Valeur incorrecte dans le stock à la ligne {row_id + 1}."
+            ) from exc
+
+        if width <= 0 or height <= 0 or quantity <= 0:
+            continue
+
+        stock_id = cell_to_text(row["ID stock"]) or f"STOCK-{row_id + 1:03d}"
+        material = cell_to_text(row["Matière"])
+        thickness = cell_to_text(row["Épaisseur"])
+        stock_type = cell_to_text(row["Type"]) or "Tôle complète"
+
+        if not thickness:
+            raise ValueError(
+                f"Épaisseur manquante dans le stock à la ligne {row_id + 1}."
+            )
+
+        for copy_number in range(1, quantity + 1):
+            instances.append(
+                StockSheet(
+                    instance_id=f"{stock_id}-{copy_number:03d}",
+                    row_id=int(row_id),
+                    stock_id=stock_id,
+                    material=material,
+                    thickness=thickness,
+                    width=width,
+                    height=height,
+                    stock_type=stock_type,
+                    priority=priority,
+                )
+            )
+
+    return instances
+
+
+def copy_key(piece: DxfPiece, copy_index: int) -> tuple[str, int]:
+    return piece.reference_key, int(copy_index)
+
+
+def placement_key(placement: Placement) -> tuple[str, int]:
+    return normalize_reference(placement.reference), int(placement.copy_index)
+
+
+def remove_placed_copies(
+    remaining: list[tuple[DxfPiece, int]],
+    placements: list[Placement],
+) -> list[tuple[DxfPiece, int]]:
+    used_keys = {placement_key(item) for item in placements}
+
+    return [
+        (piece, copy_index)
+        for piece, copy_index in remaining
+        if copy_key(piece, copy_index) not in used_keys
+    ]
+
+
+def stock_orderings(
+    stock_sheets: list[StockSheet],
+    objective: str,
+) -> list[list[StockSheet]]:
+    def type_rank(item: StockSheet) -> int:
+        return 0 if "CHUTE" in material_key(item.stock_type) else 1
+
+    orderings = [
+        sorted(
+            stock_sheets,
+            key=lambda item: (
+                item.priority,
+                type_rank(item),
+                item.width * item.height,
+            ),
+        ),
+        sorted(
+            stock_sheets,
+            key=lambda item: (
+                item.priority,
+                type_rank(item),
+                -(item.width * item.height),
+            ),
+        ),
+        sorted(
+            stock_sheets,
+            key=lambda item: (
+                type_rank(item),
+                item.width * item.height,
+                item.priority,
+            ),
+        ),
+    ]
+
+    if objective == "Minimiser le nombre de plaques":
+        orderings.insert(
+            0,
+            sorted(
+                stock_sheets,
+                key=lambda item: (
+                    item.priority,
+                    -(item.width * item.height),
+                ),
+            ),
+        )
+
+    unique = []
+    signatures = set()
+
+    for ordering in orderings:
+        signature = tuple(item.instance_id for item in ordering)
+
+        if signature not in signatures:
+            signatures.add(signature)
+            unique.append(ordering)
+
+    return unique
+
+
+def quality_parameters(quality_mode: str) -> tuple[int, int, int]:
+    settings = {
+        "Rapide": (1, 1, 70),
+        "Équilibré": (3, 2, 150),
+        "Approfondi": (7, 3, 280),
+        "Maximum": (12, 3, 420),
+        "Pro dense": (18, 3, 650),
+    }
+    return settings.get(quality_mode, settings["Équilibré"])
+
+
+def fill_one_variable_sheet(
+    remaining: list[tuple[DxfPiece, int]],
+    width: float,
+    height: float,
+    margin: float,
+    clearance: float,
+    rotations: list[int],
+    allow_hole_nesting: bool,
+    quality_mode: str,
+    rotation_cache: dict[tuple[str, int], Polygon],
+    deadline: float,
+) -> list[Placement]:
+    if not remaining or time.perf_counter() >= deadline:
+        return []
+
+    attempts, quality_level, max_candidates = quality_parameters(quality_mode)
+    best_placements: list[Placement] = []
+    best_score = None
+
+    for attempt_index in range(attempts):
+        if time.perf_counter() >= deadline:
+            break
+
+        ordered = order_piece_copies(
+            remaining,
+            attempt_index,
+        )
+
+        placements, _, _, timed_out = nest_one_order(
+            ordered,
+            width,
+            height,
+            margin,
+            clearance,
+            rotations,
+            allow_hole_nesting,
+            quality_level,
+            max_candidates,
+            rotation_cache,
+            deadline,
+            sheet_limit=1,
+        )
+
+        if timed_out:
+            break
+
+        used_area = sum(
+            item.original_polygon.area
+            for item in placements
+        )
+
+        if placements:
+            max_x = max(item.polygon.bounds[2] for item in placements)
+            max_y = max(item.polygon.bounds[3] for item in placements)
+        else:
+            max_x = width
+            max_y = height
+
+        score = (
+            -round(used_area, 2),
+            -len(placements),
+            round(max_y, 2),
+            round(max_x, 2),
+        )
+
+        if best_score is None or score < best_score:
+            best_score = score
+            best_placements = placements
+
+    return best_placements
+
+
+def quick_shelf_pack_expanded(
+    remaining: list[tuple[DxfPiece, int]],
+    sheet_width: float,
+    sheet_height: float,
+    margin: float,
+    clearance: float,
+    rotations: list[int],
+    rotation_cache: dict[tuple[str, int], Polygon],
+) -> tuple[list[Placement], list[list[Placement]], list[str]]:
+    inner_right = sheet_width - margin
+    inner_top = sheet_height - margin
+    simple_rotations = [
+        angle
+        for angle in (0, 90, 180, 270)
+        if angle in rotations
+    ] or [rotations[0] if rotations else 0]
+
+    ordered = sorted(
+        remaining,
+        key=lambda item: item[0].polygon.area,
+        reverse=True,
+    )
+
+    sheets_data = []
+    unplaced = []
+
+    for piece, copy_index in ordered:
+        versions = []
+
+        for angle in simple_rotations:
+            cache_key = (piece.reference_key, angle)
+
+            if cache_key not in rotation_cache:
+                rotation_cache[cache_key] = rotated_at_origin(
+                    piece.polygon,
+                    angle,
+                )
+
+            polygon = rotation_cache[cache_key]
+            width = polygon.bounds[2] - polygon.bounds[0]
+            height = polygon.bounds[3] - polygon.bounds[1]
+            versions.append((angle, polygon, width, height))
+
+        best = None
+
+        for sheet_index, sheet_data in enumerate(sheets_data):
+            for shelf_index, shelf in enumerate(sheet_data["shelves"]):
+                for angle, polygon, width, height in versions:
+                    if (
+                        height <= shelf["height"] + 1e-6
+                        and shelf["x"] + width <= inner_right + 1e-6
+                    ):
+                        score = (
+                            0,
+                            inner_right - (shelf["x"] + width),
+                            shelf["y"],
+                        )
+
+                        if best is None or score < best[0]:
+                            best = (
+                                score,
+                                sheet_index,
+                                shelf_index,
+                                angle,
+                                polygon,
+                                width,
+                                height,
+                            )
+
+            new_y = (
+                margin
+                if not sheet_data["shelves"]
+                else max(
+                    shelf["y"] + shelf["height"] + clearance
+                    for shelf in sheet_data["shelves"]
+                )
+            )
+
+            for angle, polygon, width, height in versions:
+                if (
+                    margin + width <= inner_right + 1e-6
+                    and new_y + height <= inner_top + 1e-6
+                ):
+                    score = (1, new_y + height, width)
+
+                    if best is None or score < best[0]:
+                        best = (
+                            score,
+                            sheet_index,
+                            None,
+                            angle,
+                            polygon,
+                            width,
+                            height,
+                        )
+
+        if best is None:
+            valid = [
+                (height * width, angle, polygon, width, height)
+                for angle, polygon, width, height in versions
+                if (
+                    margin + width <= inner_right + 1e-6
+                    and margin + height <= inner_top + 1e-6
+                )
+            ]
+
+            if not valid:
+                unplaced.append(
+                    f"{piece.reference_display} - copie {copy_index}"
+                )
+                continue
+
+            _, angle, polygon, width, height = min(valid)
+            sheet_index = len(sheets_data)
+            sheets_data.append(
+                {
+                    "placements": [],
+                    "shelves": [
+                        {
+                            "x": margin,
+                            "y": margin,
+                            "height": height,
+                        }
+                    ],
+                }
+            )
+            shelf_index = 0
+        else:
+            (
+                _,
+                sheet_index,
+                shelf_index,
+                angle,
+                polygon,
+                width,
+                height,
+            ) = best
+
+            if shelf_index is None:
+                sheet_data = sheets_data[sheet_index]
+                new_y = (
+                    margin
+                    if not sheet_data["shelves"]
+                    else max(
+                        shelf["y"] + shelf["height"] + clearance
+                        for shelf in sheet_data["shelves"]
+                    )
+                )
+                sheet_data["shelves"].append(
+                    {
+                        "x": margin,
+                        "y": new_y,
+                        "height": height,
+                    }
+                )
+                shelf_index = len(sheet_data["shelves"]) - 1
+
+        shelf = sheets_data[sheet_index]["shelves"][shelf_index]
+        placed_polygon = affinity.translate(
+            polygon,
+            xoff=shelf["x"],
+            yoff=shelf["y"],
+        )
+
+        placement = Placement(
+            reference=piece.reference_display,
+            source_name=piece.source_name,
+            sheet_index=sheet_index,
+            rotation=angle,
+            polygon=placed_polygon,
+            original_polygon=piece.polygon,
+            copy_index=copy_index,
+            thickness=piece.thickness,
+            material=piece.material,
+        )
+
+        sheets_data[sheet_index]["placements"].append(placement)
+        shelf["x"] += width + clearance
+        shelf["height"] = max(shelf["height"], height)
+
+    sheets = [
+        item["placements"]
+        for item in sheets_data
+    ]
+    placements = [
+        placement
+        for sheet in sheets
+        for placement in sheet
+    ]
+
+    return placements, sheets, unplaced
+
+
+def insert_item_variable(
+    item: Placement,
+    target_sheets: list[list[Placement]],
+    target_metas: list[SheetMeta],
+    margin: float,
+    clearance: float,
+    rotations: list[int],
+    allow_hole_nesting: bool,
+    rotation_cache: dict[tuple[str, int], Polygon],
+    deadline: float,
+) -> bool:
+    reference_key = normalize_reference(item.reference)
+    best = None
+
+    for target_index, (target, meta) in enumerate(
+        zip(target_sheets, target_metas)
+    ):
+        if time.perf_counter() >= deadline:
+            return False
+
+        fixed = [placed.polygon for placed in target]
+        sheet_inner = box(
+            margin,
+            margin,
+            meta.width - margin,
+            meta.height - margin,
+        )
+
+        current_max_x = max(
+            (polygon.bounds[2] for polygon in fixed),
+            default=margin,
+        )
+        current_max_y = max(
+            (polygon.bounds[3] for polygon in fixed),
+            default=margin,
+        )
+        current_area = sum(polygon.area for polygon in fixed)
+
+        item_piece = piece_like_from_placement(item)
+
+        for angle in piece_rotation_angles(item_piece, rotations):
+            cache_key = (reference_key, angle)
+
+            if cache_key not in rotation_cache:
+                rotation_cache[cache_key] = rotated_at_origin(
+                    item.original_polygon,
+                    angle,
+                )
+
+            rotated = rotation_cache[cache_key]
+            width = rotated.bounds[2] - rotated.bounds[0]
+            height = rotated.bounds[3] - rotated.bounds[1]
+
+            if (
+                width > meta.width - 2 * margin + 1e-6
+                or height > meta.height - 2 * margin + 1e-6
+            ):
+                continue
+
+            positions = candidate_positions(
+                rotated,
+                fixed,
+                margin,
+                clearance,
+                meta.width,
+                meta.height,
+                allow_hole_nesting,
+                2,
+                180,
+            )
+
+            for x, y in positions:
+                candidate = affinity.translate(
+                    rotated,
+                    xoff=x,
+                    yoff=y,
+                )
+
+                if not fits_on_sheet(
+                    candidate,
+                    fixed,
+                    sheet_inner,
+                    clearance,
+                ):
+                    continue
+
+                candidate = directional_compact(
+                    candidate,
+                    fixed,
+                    sheet_inner,
+                    clearance,
+                    minimum_step=1.0,
+                )
+
+                score = placement_score(
+                    candidate,
+                    current_max_x,
+                    current_max_y,
+                    current_area,
+                    fixed,
+                    sheet_inner,
+                    clearance,
+                    margin,
+                )
+
+                if best is None or score < best[0]:
+                    best = (
+                        score,
+                        target_index,
+                        angle,
+                        candidate,
+                    )
+
+    if best is None:
+        return False
+
+    _, target_index, angle, candidate = best
+    target_sheets[target_index].append(
+        Placement(
+            reference=item.reference,
+            source_name=item.source_name,
+            sheet_index=target_index,
+            rotation=angle,
+            polygon=candidate,
+            original_polygon=item.original_polygon,
+            copy_index=item.copy_index,
+            thickness=item.thickness,
+            material=item.material,
+        )
+    )
+    return True
+
+
+def consolidate_variable_sheets(
+    sheets: list[list[Placement]],
+    metas: list[SheetMeta],
+    margin: float,
+    clearance: float,
+    rotations: list[int],
+    allow_hole_nesting: bool,
+    deadline: float,
+) -> tuple[list[list[Placement]], list[SheetMeta]]:
+    rotation_cache: dict[tuple[str, int], Polygon] = {}
+
+    while len(sheets) > 1 and time.perf_counter() < deadline:
+        source_order = sorted(
+            range(len(sheets)),
+            key=lambda index: (
+                0 if metas[index].source == "Achat" else 1,
+                sum(
+                    item.original_polygon.area
+                    for item in sheets[index]
+                )
+                / max(1.0, metas[index].width * metas[index].height),
+            ),
+        )
+
+        improved = False
+
+        for source_index in source_order:
+            if time.perf_counter() >= deadline:
+                break
+
+            candidate_sheets = [
+                list(sheet)
+                for index, sheet in enumerate(sheets)
+                if index != source_index
+            ]
+            candidate_metas = [
+                meta
+                for index, meta in enumerate(metas)
+                if index != source_index
+            ]
+
+            source_items = sorted(
+                sheets[source_index],
+                key=lambda item: item.original_polygon.area,
+                reverse=True,
+            )
+
+            success = True
+
+            for item in source_items:
+                if not insert_item_variable(
+                    item,
+                    candidate_sheets,
+                    candidate_metas,
+                    margin,
+                    clearance,
+                    rotations,
+                    allow_hole_nesting,
+                    rotation_cache,
+                    deadline,
+                ):
+                    success = False
+                    break
+
+            if success:
+                sheets = candidate_sheets
+                metas = candidate_metas
+                improved = True
+                break
+
+        if not improved:
+            break
+
+    for sheet_index, (sheet, meta) in enumerate(zip(sheets, metas)):
+        meta.sheet_index = sheet_index
+
+        for placement in sheet:
+            placement.sheet_index = sheet_index
+
+    return sheets, metas
+
+
+def strategy_score(
+    placements: list[Placement],
+    metas: list[SheetMeta],
+    unplaced: list[str],
+    objective: str,
+) -> tuple:
+    purchase_count = sum(
+        1 for meta in metas if meta.source == "Achat"
+    )
+    total_sheet_area = sum(
+        meta.width * meta.height
+        for meta in metas
+    )
+    piece_area = sum(
+        item.original_polygon.area
+        for item in placements
+    )
+    waste_area = max(0.0, total_sheet_area - piece_area)
+
+    if objective == "Minimiser le nombre de plaques":
+        return (
+            len(unplaced),
+            len(metas),
+            purchase_count,
+            round(waste_area, 1),
+        )
+
+    if objective == "Minimiser la surface consommée":
+        return (
+            len(unplaced),
+            round(total_sheet_area, 1),
+            purchase_count,
+            len(metas),
+        )
+
+    return (
+        len(unplaced),
+        purchase_count,
+        round(total_sheet_area, 1),
+        len(metas),
+    )
+
+
+def optimize_group_with_stock(
+    pieces: list[DxfPiece],
+    stock_sheets: list[StockSheet],
+    purchase_width: float,
+    purchase_height: float,
+    allow_purchase: bool,
+    margin: float,
+    clearance: float,
+    rotations: list[int],
+    allow_hole_nesting: bool,
+    quality_mode: str,
+    objective: str,
+    time_budget_seconds: float,
+    progress_callback=None,
+) -> tuple[
+    list[Placement],
+    list[SheetMeta],
+    list[str],
+    set[str],
+]:
+    expanded = expand_piece_copies(pieces)
+    rotation_cache: dict[tuple[str, int], Polygon] = {}
+    start_time = time.perf_counter()
+    global_deadline = start_time + max(15.0, float(time_budget_seconds))
+
+    orderings = stock_orderings(stock_sheets, objective)
+
+    if not orderings:
+        orderings = [[]]
+
+    if quality_mode == "Rapide":
+        orderings = orderings[:1]
+    elif quality_mode == "Équilibré":
+        orderings = orderings[:2]
+
+    best_result = None
+
+    for strategy_index, ordered_stock in enumerate(orderings):
+        if time.perf_counter() >= global_deadline and best_result is not None:
+            break
+
+        remaining = list(expanded)
+        strategy_sheets: list[list[Placement]] = []
+        strategy_metas: list[SheetMeta] = []
+        used_stock_ids: set[str] = set()
+
+        sheets_left = max(1, len(ordered_stock))
+        strategy_remaining_time = max(
+            5.0,
+            global_deadline - time.perf_counter(),
+        )
+        per_sheet_budget = max(
+            2.0,
+            strategy_remaining_time / (sheets_left + 2),
+        )
+
+        for stock_position, stock_sheet in enumerate(ordered_stock):
+            if not remaining:
+                break
+
+            if time.perf_counter() >= global_deadline:
+                break
+
+            local_deadline = min(
+                global_deadline,
+                time.perf_counter() + per_sheet_budget,
+            )
+
+            selected = fill_one_variable_sheet(
+                remaining,
+                stock_sheet.width,
+                stock_sheet.height,
+                margin,
+                clearance,
+                rotations,
+                allow_hole_nesting,
+                quality_mode,
+                rotation_cache,
+                local_deadline,
+            )
+
+            if not selected:
+                continue
+
+            sheet_index = len(strategy_sheets)
+
+            for placement in selected:
+                placement.sheet_index = sheet_index
+
+            strategy_sheets.append(selected)
+            strategy_metas.append(
+                SheetMeta(
+                    sheet_index=sheet_index,
+                    sheet_id=stock_sheet.instance_id,
+                    material=pieces[0].material,
+                    thickness=pieces[0].thickness,
+                    width=stock_sheet.width,
+                    height=stock_sheet.height,
+                    source="Stock",
+                    stock_type=stock_sheet.stock_type,
+                    stock_row_id=stock_sheet.row_id,
+                    priority=stock_sheet.priority,
+                )
+            )
+            used_stock_ids.add(stock_sheet.instance_id)
+            remaining = remove_placed_copies(
+                remaining,
+                selected,
+            )
+
+            if progress_callback is not None and ordered_stock:
+                progress_callback(
+                    min(
+                        0.65,
+                        0.65
+                        * (stock_position + 1)
+                        / len(ordered_stock),
+                    )
+                )
+
+        if remaining and allow_purchase:
+            purchase_deadline = max(
+                global_deadline,
+                time.perf_counter() + 8.0,
+            )
+
+            attempts, quality_level, max_candidates = quality_parameters(
+                quality_mode
+            )
+            purchase_best = None
+
+            for attempt_index in range(attempts):
+                if time.perf_counter() >= purchase_deadline:
+                    break
+
+                ordered_remaining = order_piece_copies(
+                    remaining,
+                    attempt_index,
+                )
+
+                placements, sheets, unplaced, timed_out = nest_one_order(
+                    ordered_remaining,
+                    purchase_width,
+                    purchase_height,
+                    margin,
+                    clearance,
+                    rotations,
+                    allow_hole_nesting,
+                    quality_level,
+                    max_candidates,
+                    rotation_cache,
+                    purchase_deadline,
+                )
+
+                if timed_out:
+                    break
+
+                score = (
+                    len(unplaced),
+                    len(sheets),
+                    sum(
+                        (
+                            max(
+                                (item.polygon.bounds[2] for item in sheet),
+                                default=margin,
+                            )
+                            * max(
+                                (item.polygon.bounds[3] for item in sheet),
+                                default=margin,
+                            )
+                        )
+                        for sheet in sheets
+                    ),
+                )
+
+                if purchase_best is None or score < purchase_best[0]:
+                    purchase_best = (
+                        score,
+                        placements,
+                        sheets,
+                        unplaced,
+                    )
+
+            if purchase_best is None:
+                (
+                    purchase_placements,
+                    purchase_sheets,
+                    purchase_unplaced,
+                ) = quick_shelf_pack_expanded(
+                    remaining,
+                    purchase_width,
+                    purchase_height,
+                    margin,
+                    clearance,
+                    rotations,
+                    rotation_cache,
+                )
+            else:
+                (
+                    _,
+                    purchase_placements,
+                    purchase_sheets,
+                    purchase_unplaced,
+                ) = purchase_best
+
+            purchase_offset = len(strategy_sheets)
+
+            for local_index, sheet in enumerate(purchase_sheets):
+                global_index = purchase_offset + local_index
+
+                for placement in sheet:
+                    placement.sheet_index = global_index
+
+                strategy_sheets.append(sheet)
+                strategy_metas.append(
+                    SheetMeta(
+                        sheet_index=global_index,
+                        sheet_id=(
+                            f"ACHAT-{material_key(pieces[0].material) or 'MAT'}-"
+                            f"{thickness_key(pieces[0].thickness)}-"
+                            f"{local_index + 1:03d}"
+                        ),
+                        material=pieces[0].material,
+                        thickness=pieces[0].thickness,
+                        width=purchase_width,
+                        height=purchase_height,
+                        source="Achat",
+                        stock_type="Tôle neuve",
+                        stock_row_id=None,
+                        priority=999,
+                    )
+                )
+
+            remaining = remove_placed_copies(
+                remaining,
+                purchase_placements,
+            )
+
+        unplaced = [
+            f"{piece.reference_display} - copie {copy_index}"
+            for piece, copy_index in remaining
+        ]
+
+        consolidation_deadline = min(
+            global_deadline,
+            time.perf_counter() + max(
+                3.0,
+                time_budget_seconds * 0.20,
+            ),
+        )
+
+        strategy_sheets, strategy_metas = consolidate_variable_sheets(
+            strategy_sheets,
+            strategy_metas,
+            margin,
+            clearance,
+            rotations,
+            allow_hole_nesting,
+            consolidation_deadline,
+        )
+
+        strategy_placements = [
+            item
+            for sheet in strategy_sheets
+            for item in sheet
+        ]
+
+        score = strategy_score(
+            strategy_placements,
+            strategy_metas,
+            unplaced,
+            objective,
+        )
+
+        result = (
+            score,
+            strategy_placements,
+            strategy_metas,
+            unplaced,
+            used_stock_ids,
+        )
+
+        if best_result is None or score < best_result[0]:
+            best_result = result
+
+        if progress_callback is not None:
+            progress_callback(
+                min(
+                    0.98,
+                    (strategy_index + 1) / len(orderings),
+                )
+            )
+
+        if not unplaced and score[1] == 0:
+            break
+
+    if progress_callback is not None:
+        progress_callback(1.0)
+
+    if best_result is None:
+        return [], [], [
+            f"{piece.reference_display} - copie {copy_index}"
+            for piece, copy_index in expanded
+        ], set()
+
+    _, placements, metas, unplaced, used_stock_ids = best_result
+    return placements, metas, unplaced, used_stock_ids
+
+
+def variable_sheet_statistics(
+    placements: list[Placement],
+    sheet_metas: list[SheetMeta],
+) -> pd.DataFrame:
+    rows = []
+
+    for meta in sheet_metas:
+        sheet_items = [
+            item
+            for item in placements
+            if item.sheet_index == meta.sheet_index
+        ]
+        used_area = sum(
+            item.original_polygon.area
+            for item in sheet_items
+        )
+        sheet_area = meta.width * meta.height
+        usage = used_area / sheet_area * 100.0 if sheet_area else 0.0
+
+        rows.append(
+            {
+                "Tôle": meta.sheet_index + 1,
+                "ID plaque": meta.sheet_id,
+                "Source": meta.source,
+                "Type": meta.stock_type,
+                "Matière": meta.material,
+                "Épaisseur": meta.thickness,
+                "Dimensions (mm)": f"{meta.width:g} × {meta.height:g}",
+                "Nombre de pièces": len(sheet_items),
+                "Utilisation (%)": round(usage, 2),
+                "Chute (%)": round(100.0 - usage, 2),
+            }
+        )
+
+    return pd.DataFrame(rows)
+
+
+def variable_placement_table(
+    placements: list[Placement],
+    sheet_metas: list[SheetMeta],
+) -> pd.DataFrame:
+    meta_by_index = {
+        meta.sheet_index: meta
+        for meta in sheet_metas
+    }
+    rows = []
+
+    for item in placements:
+        meta = meta_by_index[item.sheet_index]
+        min_x, min_y, max_x, max_y = item.polygon.bounds
+
+        rows.append(
+            {
+                "Tôle": item.sheet_index + 1,
+                "ID plaque": meta.sheet_id,
+                "Source": meta.source,
+                "Dimensions plaque (mm)": (
+                    f"{meta.width:g} × {meta.height:g}"
+                ),
+                "Repère": item.reference,
+                "Copie": item.copy_index,
+                "Rotation (°)": item.rotation,
+                "X min (mm)": round(min_x, 2),
+                "Y min (mm)": round(min_y, 2),
+                "Largeur occupée (mm)": round(max_x - min_x, 2),
+                "Hauteur occupée (mm)": round(max_y - min_y, 2),
+                "Trous": len(item.original_polygon.interiors),
+                "Épaisseur": item.thickness,
+                "Matière": item.material,
+            }
+        )
+
+    return pd.DataFrame(rows)
+
+
+def plot_variable_sheet(
+    placements: list[Placement],
+    meta: SheetMeta,
+):
+    fig, ax = plt.subplots(figsize=(12, 6))
+    ax.set_xlim(0, meta.width)
+    ax.set_ylim(0, meta.height)
+    ax.set_aspect("equal", adjustable="box")
+    ax.set_title(
+        f"{meta.sheet_id} — {meta.width:g} × {meta.height:g} mm "
+        f"({meta.source})"
+    )
+    ax.set_xlabel("X (mm)")
+    ax.set_ylabel("Y (mm)")
+    ax.grid(True, linewidth=0.3)
+
+    sheet_items = [
+        item
+        for item in placements
+        if item.sheet_index == meta.sheet_index
+    ]
+
+    for item in sheet_items:
+        x, y = item.polygon.exterior.xy
+        filled = ax.fill(x, y, alpha=0.28)
+        ax.plot(x, y, linewidth=1)
+
+        for interior in item.polygon.interiors:
+            hx, hy = interior.xy
+            ax.fill(
+                hx,
+                hy,
+                facecolor=ax.get_facecolor(),
+                alpha=1.0,
+            )
+            ax.plot(hx, hy, linewidth=1)
+
+        point = item.polygon.representative_point()
+        ax.text(
+            point.x,
+            point.y,
+            f"{item.reference}\n#{item.copy_index}",
+            ha="center",
+            va="center",
+            fontsize=7,
+        )
+
+    return fig
+
+
+def export_variable_sheets_zip(
+    placements: list[Placement],
+    sheet_metas: list[SheetMeta],
+) -> bytes:
+    output = io.BytesIO()
+
+    with zipfile.ZipFile(
+        output,
+        "w",
+        zipfile.ZIP_DEFLATED,
+    ) as archive:
+        for meta in sheet_metas:
+            document = ezdxf.new("R2010")
+            modelspace = document.modelspace()
+
+            modelspace.add_lwpolyline(
+                [
+                    (0, 0),
+                    (meta.width, 0),
+                    (meta.width, meta.height),
+                    (0, meta.height),
+                ],
+                close=True,
+            )
+
+            for item in placements:
+                if item.sheet_index == meta.sheet_index:
+                    add_polygon_to_dxf(
+                        modelspace,
+                        item.polygon,
+                        f"{item.reference}-{item.copy_index}",
+                    )
+
+            safe_sheet_id = re.sub(
+                r"[^A-Za-z0-9_-]+",
+                "_",
+                meta.sheet_id,
+            )
+
+            with tempfile.NamedTemporaryFile(
+                suffix=".dxf",
+                delete=False,
+            ) as temporary_file:
+                temporary_name = temporary_file.name
+
+            document.saveas(temporary_name)
+            archive.write(
+                temporary_name,
+                arcname=(
+                    f"{meta.sheet_index + 1:03d}_"
+                    f"{safe_sheet_id}_"
+                    f"{meta.width:g}x{meta.height:g}.dxf"
+                ),
+            )
+            Path(temporary_name).unlink(missing_ok=True)
+
+    output.seek(0)
+    return output.getvalue()
+
+
+def stock_balance_dataframe(
+    original_stock_dataframe: pd.DataFrame,
+    used_sheet_metas: list[SheetMeta],
+) -> pd.DataFrame:
+    dataframe = ensure_stock_columns(
+        original_stock_dataframe
+    ).reset_index(drop=True)
+
+    used_by_row = defaultdict(int)
+
+    for meta in used_sheet_metas:
+        if (
+            meta.source == "Stock"
+            and meta.stock_row_id is not None
+        ):
+            used_by_row[int(meta.stock_row_id)] += 1
+
+    rows = []
+
+    for row_id, row in dataframe.iterrows():
+        try:
+            initial_quantity = int(
+                float(str(row["Quantité"]).replace(",", "."))
+            )
+        except (TypeError, ValueError):
+            initial_quantity = 0
+
+        used_quantity = used_by_row.get(int(row_id), 0)
+
+        rows.append(
+            {
+                "ID stock": row["ID stock"],
+                "Matière": row["Matière"],
+                "Épaisseur": row["Épaisseur"],
+                "Dimensions (mm)": (
+                    f"{row['Largeur (mm)']} × {row['Hauteur (mm)']}"
+                ),
+                "Type": row["Type"],
+                "Quantité initiale": initial_quantity,
+                "Quantité utilisée": used_quantity,
+                "Quantité restante": max(
+                    0,
+                    initial_quantity - used_quantity,
+                ),
+            }
+        )
+
+    return pd.DataFrame(rows)
+
+
+
+# ============================================================
 # Résultats et exports
 # ============================================================
 
@@ -2245,39 +3830,56 @@ def export_sheets_zip(
 
     output.seek(0)
     return output.getvalue()
-
-
 # ============================================================
-# Interface Streamlit
+# Interface Streamlit — V13 Stock
 # ============================================================
 
 st.set_page_config(
-    page_title="OptiTôle Pro",
+    page_title="OptiTôle Pro v13",
     page_icon="📐",
     layout="wide",
 )
 
-st.title("📐 OptiTôle Pro v12 — Optimisation universelle")
+st.title("📐 OptiTôle Pro v14 — Dense Nesting Pro")
 st.caption(
-    "Nesting de tôles à partir de DXF Advance Steel et d'une nomenclature Excel/CSV. "
-    "V12 : optimisation renforcée automatiquement pour toutes les épaisseurs."
+    "Nesting dense avec stock disponible, rotations selon les angles réels "
+    "des pièces et remplissage renforcé des vides."
 )
 
 with st.sidebar:
-    st.header("Paramètres de la tôle")
+    st.header("Paramètres de découpe")
 
-    sheet_width = st.number_input(
-        "Largeur de la tôle (mm)",
+    purchase_width = st.number_input(
+        "Largeur d'une tôle neuve (mm)",
         min_value=100.0,
         value=3000.0,
         step=100.0,
     )
 
-    sheet_height = st.number_input(
-        "Hauteur de la tôle (mm)",
+    purchase_height = st.number_input(
+        "Hauteur d'une tôle neuve (mm)",
         min_value=100.0,
         value=1500.0,
         step=100.0,
+    )
+
+    allow_purchase = st.checkbox(
+        "Autoriser l'achat de tôles complémentaires",
+        value=True,
+        help=(
+            "Si le stock disponible ne suffit pas, l'application ajoute "
+            "des tôles neuves au format défini ci-dessus."
+        ),
+    )
+
+    objective = st.selectbox(
+        "Objectif principal",
+        options=[
+            "Minimiser les achats",
+            "Minimiser la surface consommée",
+            "Minimiser le nombre de plaques",
+        ],
+        index=0,
     )
 
     margin = st.number_input(
@@ -2297,44 +3899,27 @@ with st.sidebar:
     tolerance = st.number_input(
         "Précision des courbes DXF (mm)",
         min_value=0.1,
-        value=2.0,
+        value=1.0,
         step=0.5,
-        help=(
-            "3 mm est conseillé pour un premier calcul rapide. "
-            "Réduis ensuite à 1 mm pour le contrôle final."
-        ),
     )
 
     rotation_step = st.selectbox(
         "Pas de rotation",
         options=[90, 45, 30, 15],
-        index=0,
-        help=(
-            "90° est rapide. 45°, 30° ou 15° peuvent améliorer le rendement "
-            "mais augmentent le temps de calcul."
-        ),
+        index=1,
     )
-
     rotation_options = list(range(0, 360, rotation_step))
 
     quality_mode = st.selectbox(
         "Qualité d'optimisation",
-        options=["Rapide", "Équilibré", "Approfondi", "Maximum"],
-        index=2,
-        help=(
-            "Le mode Maximum applique le calcul renforcé à toutes les "
-            "matières et à toutes les épaisseurs."
-        ),
+        options=["Rapide", "Équilibré", "Approfondi", "Maximum", "Pro dense"],
+        index=4,
     )
 
     time_budget_seconds = st.select_slider(
-        "Temps maximum d'amélioration par projet (secondes)",
-        options=[60, 90, 180, 300, 600],
-        value=180,
-        help=(
-            "Temps global approximatif pour l'ensemble du projet. "
-            "Il est réparti automatiquement selon la complexité de chaque épaisseur."
-        ),
+        "Temps maximum global (secondes)",
+        options=[90, 180, 300, 600, 900],
+        value=300,
     )
 
     allow_hole_nesting = st.checkbox(
@@ -2342,18 +3927,168 @@ with st.sidebar:
         value=True,
     )
 
+    natural_edge_angles = st.checkbox(
+        "Rotations selon les angles réels des pièces",
+        value=True,
+        help=(
+            "Ajoute automatiquement les orientations des arêtes principales "
+            "des pièces. Très utile pour les pièces coudées et inclinées."
+        ),
+    )
+
+    candidate_multiplier_ui = st.select_slider(
+        "Densité de recherche des positions",
+        options=[1.0, 1.5, 2.0, 3.0],
+        value=2.0,
+        help=(
+            "Plus la valeur est élevée, plus le moteur essaie de positions. "
+            "Le calcul est plus long mais généralement plus dense."
+        ),
+    )
+
     st.info(
-        "La v12 applique les mêmes méthodes avancées à toutes les épaisseurs : "
-        "multi-démarrages, alignement des bords inclinés, compactage et fusion "
-        "des tôles les moins remplies."
+        "Les plaques de stock compatibles sont essayées en priorité. "
+        "Les dimensions réelles de chaque plaque sont respectées."
     )
 
     st.warning(
-        "Ce moteur reste un MVP heuristique. "
-        "Vérifie toujours le DXF exporté avant une découpe réelle."
+        "Le moteur reste heuristique : contrôle obligatoire des DXF "
+        "avant toute découpe en production."
     )
 
-st.subheader("1. Charger les fichiers")
+
+st.subheader("1. Stock disponible")
+
+stock_upload_column, stock_download_column = st.columns(2)
+
+with stock_upload_column:
+    stock_upload = st.file_uploader(
+        "Importer un stock CSV",
+        type=["csv"],
+        key="stock_csv_upload",
+    )
+
+    load_stock_button = st.button(
+        "Charger le CSV dans le tableau",
+        use_container_width=True,
+    )
+
+with stock_download_column:
+    template_csv = default_stock_dataframe(
+        purchase_width,
+        purchase_height,
+    ).to_csv(
+        index=False,
+        sep=";",
+    ).encode("utf-8-sig")
+
+    st.download_button(
+        "Télécharger un modèle de stock CSV",
+        data=template_csv,
+        file_name="modele_stock_optitole.csv",
+        mime="text/csv",
+        use_container_width=True,
+    )
+
+if "stock_data" not in st.session_state:
+    st.session_state["stock_data"] = default_stock_dataframe(
+        purchase_width,
+        purchase_height,
+    )
+
+if load_stock_button:
+    if stock_upload is None:
+        st.warning("Sélectionne d'abord un fichier CSV de stock.")
+    else:
+        try:
+            st.session_state["stock_data"] = read_stock_csv(
+                stock_upload
+            )
+            st.session_state.pop("stock_editor", None)
+            st.success("Le stock CSV a été chargé.")
+            st.rerun()
+        except Exception as exc:
+            st.error(str(exc))
+
+stock_dataframe = st.data_editor(
+    st.session_state["stock_data"],
+    num_rows="dynamic",
+    use_container_width=True,
+    hide_index=True,
+    key="stock_editor",
+    column_config={
+        "Utiliser": st.column_config.CheckboxColumn(
+            "Utiliser",
+            default=True,
+        ),
+        "ID stock": st.column_config.TextColumn(
+            "ID stock",
+            help="Référence interne de la plaque ou de la chute.",
+        ),
+        "Matière": st.column_config.TextColumn(
+            "Matière",
+            help="Exemples : S235JR, S355, Inox. Utilise * pour toutes.",
+        ),
+        "Épaisseur": st.column_config.TextColumn(
+            "Épaisseur",
+            help="Exemples : 5, 6, 10.",
+        ),
+        "Largeur (mm)": st.column_config.NumberColumn(
+            "Largeur (mm)",
+            min_value=1.0,
+            format="%.1f",
+        ),
+        "Hauteur (mm)": st.column_config.NumberColumn(
+            "Hauteur (mm)",
+            min_value=1.0,
+            format="%.1f",
+        ),
+        "Quantité": st.column_config.NumberColumn(
+            "Quantité",
+            min_value=0,
+            step=1,
+            format="%d",
+        ),
+        "Type": st.column_config.SelectboxColumn(
+            "Type",
+            options=[
+                "Tôle complète",
+                "Chute rectangulaire",
+                "Réservée",
+            ],
+        ),
+        "Priorité": st.column_config.NumberColumn(
+            "Priorité",
+            help="1 est prioritaire sur 10.",
+            step=1,
+            format="%d",
+        ),
+    },
+)
+
+st.session_state["stock_data"] = stock_dataframe
+
+current_stock_csv = ensure_stock_columns(
+    stock_dataframe
+).to_csv(
+    index=False,
+    sep=";",
+).encode("utf-8-sig")
+
+st.download_button(
+    "Télécharger le stock actuellement saisi",
+    data=current_stock_csv,
+    file_name="stock_disponible_optitole.csv",
+    mime="text/csv",
+)
+
+st.caption(
+    "Chaque ligne peut représenter plusieurs plaques identiques grâce à la "
+    "colonne Quantité. Les chutes doivent être rectangulaires dans cette version."
+)
+
+
+st.subheader("2. Charger les fichiers de fabrication")
 
 left, right = st.columns(2)
 
@@ -2369,10 +4104,11 @@ with right:
         type=["xlsx", "csv"],
     )
 
-st.subheader("2. Lancer l'analyse et l'optimisation")
+
+st.subheader("3. Lancer l'analyse et l'optimisation")
 
 run_button = st.button(
-    "Analyser les DXF et optimiser les tôles",
+    "Analyser le stock, les DXF et optimiser",
     type="primary",
     use_container_width=True,
 )
@@ -2392,8 +4128,17 @@ if run_button:
         st.stop()
 
     try:
+        USE_NATURAL_EDGE_ANGLES = bool(natural_edge_angles)
+        DENSE_CANDIDATE_MULTIPLIER = float(candidate_multiplier_ui)
+
+        stock_instances = prepare_stock_instances(
+            stock_dataframe
+        )
+
         with st.spinner("Lecture de la nomenclature..."):
-            nomenclature = read_nomenclature(nomenclature_file)
+            nomenclature = read_nomenclature(
+                nomenclature_file
+            )
 
         with st.spinner("Lecture et contrôle des DXF..."):
             dxf_files = read_dxf_zip(dxf_zip)
@@ -2412,203 +4157,182 @@ if run_button:
                 {
                     "Repère": piece.reference_display,
                     "Fichier": piece.source_name,
-                    "Trous détectés": len(piece.polygon.interiors),
-                    "Surface nette (mm²)": round(piece.polygon.area, 1),
+                    "Trous détectés": len(
+                        piece.polygon.interiors
+                    ),
+                    "Surface nette (mm²)": round(
+                        piece.polygon.area,
+                        1,
+                    ),
                 }
                 for piece in pieces
             ]
         )
-        total_detected_holes = int(dxf_diagnostic["Trous détectés"].sum())
-
-        if total_detected_holes == 0:
-            st.warning(
-                "Aucun contour de trou n'a été trouvé dans les DXF. "
-                "Le fichier Advance Steel peut ne pas contenir les perçages, "
-                "ou ceux-ci peuvent être exportés uniquement comme marques."
-            )
 
         groups = defaultdict(list)
 
         for piece in pieces:
-            groups[(piece.material, piece.thickness)].append(piece)
+            groups[
+                (piece.material, piece.thickness)
+            ].append(piece)
 
-        all_placements: list[Placement] = []
-        group_reports = []
-        unplaced_messages = []
-        export_files = io.BytesIO()
-
-        group_complexities = {
+        group_weights = {
             group_key: group_complexity_weight(group_pieces)
             for group_key, group_pieces in groups.items()
         }
-        total_project_complexity = max(
+        total_weight = max(
             1.0,
-            sum(group_complexities.values()),
+            sum(group_weights.values()),
         )
 
-        with zipfile.ZipFile(
-            export_files,
-            "w",
-            zipfile.ZIP_DEFLATED,
-        ) as master_zip:
-            global_sheet_offset = 0
+        available_stock = list(stock_instances)
+        all_placements: list[Placement] = []
+        all_sheet_metas: list[SheetMeta] = []
+        group_reports = []
+        unplaced_messages = []
+        global_sheet_offset = 0
 
-            for (material, thickness), group_pieces in groups.items():
-                total_group_copies = sum(
-                    piece.quantity
-                    for piece in group_pieces
-                )
-
-                st.write(
-                    f"Optimisation : **{material} — épaisseur {thickness}** "
-                    f"({total_group_copies} pièce(s))"
-                )
-
-                progress_bar = st.progress(0)
-
-                def update_group_progress(value):
-                    progress_bar.progress(
-                        min(100, max(0, int(value * 100)))
-                    )
-
-                group_weight = group_complexities[
-                    (material, thickness)
-                ]
-
-                group_time_budget = max(
-                    15.0,
-                    float(time_budget_seconds)
-                    * group_weight
-                    / total_project_complexity,
-                )
-
-                st.caption(
-                    f"Budget automatique pour ce groupe : "
-                    f"{group_time_budget:.0f} s — "
-                    f"calcul déterminé par la quantité et la complexité des formes."
-                )
-
-                placements, sheet_count, unplaced = nest_pieces(
-                    group_pieces,
-                    sheet_width,
-                    sheet_height,
-                    margin,
-                    clearance,
-                    sorted(rotation_options),
-                    quality_mode=quality_mode,
-                    allow_hole_nesting=allow_hole_nesting,
-                    time_budget_seconds=group_time_budget,
-                    progress_callback=update_group_progress,
-                )
-
-                progress_bar.empty()
-
-                for placement in placements:
-                    placement.sheet_index += global_sheet_offset
-
-                all_placements.extend(placements)
-
-                group_piece_area = sum(
-                    piece.polygon.area * piece.quantity
-                    for piece in group_pieces
-                )
-                usable_sheet_area = max(
-                    1.0,
-                    (sheet_width - 2 * margin)
-                    * (sheet_height - 2 * margin),
-                )
-                theoretical_minimum = math.ceil(
-                    group_piece_area / usable_sheet_area
-                )
-                material_yield = (
-                    group_piece_area
-                    / max(1.0, sheet_count * usable_sheet_area)
-                    * 100.0
-                )
-
-                group_reports.append(
-                    {
-                        "Matière": material,
-                        "Épaisseur": thickness,
-                        "Tôles utilisées": sheet_count,
-                        "Minimum théorique": theoretical_minimum,
-                        "Écart": sheet_count - theoretical_minimum,
-                        "Rendement matière (%)": round(material_yield, 2),
-                        "Chute estimée (%)": round(100.0 - material_yield, 2),
-                        "Pièces placées": len(placements),
-                        "Trous détectés": sum(
-                            len(piece.polygon.interiors) * piece.quantity
-                            for piece in group_pieces
-                        ),
-                        "Pièces non placées": len(unplaced),
-                    }
-                )
-
-                if unplaced:
-                    unplaced_messages.append(
-                        f"{material} / {thickness} : "
-                        + ", ".join(unplaced)
-                    )
-
-                local_placements = [
-                    Placement(
-                        reference=p.reference,
-                        source_name=p.source_name,
-                        sheet_index=(
-                            p.sheet_index
-                            - global_sheet_offset
-                        ),
-                        rotation=p.rotation,
-                        polygon=p.polygon,
-                        original_polygon=p.original_polygon,
-                        copy_index=p.copy_index,
-                        thickness=p.thickness,
-                        material=p.material,
-                    )
-                    for p in placements
-                ]
-
-                group_zip = export_sheets_zip(
-                    local_placements,
-                    sheet_count,
-                    sheet_width,
-                    sheet_height,
-                )
-
-                safe_material = re.sub(
-                    r"[^A-Za-z0-9_-]+",
-                    "_",
+        for group_number, (
+            (material, thickness),
+            group_pieces,
+        ) in enumerate(groups.items(), start=1):
+            group_stock = [
+                item
+                for item in available_stock
+                if stock_matches_group(
+                    item,
                     material,
-                )
-
-                safe_thickness = re.sub(
-                    r"[^A-Za-z0-9_-]+",
-                    "_",
                     thickness,
                 )
+            ]
 
-                with zipfile.ZipFile(
-                    io.BytesIO(group_zip)
-                ) as inner_zip:
-                    for inner_name in inner_zip.namelist():
-                        master_zip.writestr(
-                            (
-                                f"{safe_material}_"
-                                f"{safe_thickness}/"
-                                f"{inner_name}"
-                            ),
-                            inner_zip.read(inner_name),
-                        )
+            group_time_budget = max(
+                15.0,
+                float(time_budget_seconds)
+                * group_weights[(material, thickness)]
+                / total_weight,
+            )
 
-                global_sheet_offset += sheet_count
+            st.write(
+                f"Optimisation : **{material} — épaisseur {thickness}** "
+                f"avec {len(group_stock)} plaque(s) de stock compatible(s)."
+            )
 
-        total_sheets = global_sheet_offset
-        details = placement_table(all_placements)
-        sheet_summary = sheet_statistics(
+            progress_bar = st.progress(0)
+
+            def update_group_progress(value):
+                progress_bar.progress(
+                    min(
+                        100,
+                        max(0, int(value * 100)),
+                    )
+                )
+
+            (
+                placements,
+                sheet_metas,
+                unplaced,
+                used_stock_ids,
+            ) = optimize_group_with_stock(
+                group_pieces,
+                group_stock,
+                purchase_width,
+                purchase_height,
+                allow_purchase,
+                margin,
+                clearance,
+                sorted(rotation_options),
+                allow_hole_nesting,
+                quality_mode,
+                objective,
+                group_time_budget,
+                progress_callback=update_group_progress,
+            )
+
+            progress_bar.empty()
+
+            for placement in placements:
+                placement.sheet_index += global_sheet_offset
+
+            for meta in sheet_metas:
+                meta.sheet_index += global_sheet_offset
+
+            all_placements.extend(placements)
+            all_sheet_metas.extend(sheet_metas)
+
+            available_stock = [
+                item
+                for item in available_stock
+                if item.instance_id not in used_stock_ids
+            ]
+
+            piece_area = sum(
+                piece.polygon.area * piece.quantity
+                for piece in group_pieces
+            )
+            sheet_area = sum(
+                meta.width * meta.height
+                for meta in sheet_metas
+            )
+            yield_percentage = (
+                piece_area / sheet_area * 100.0
+                if sheet_area > 0
+                else 0.0
+            )
+            stock_used = sum(
+                1
+                for meta in sheet_metas
+                if meta.source == "Stock"
+            )
+            purchased = sum(
+                1
+                for meta in sheet_metas
+                if meta.source == "Achat"
+            )
+
+            group_reports.append(
+                {
+                    "Matière": material,
+                    "Épaisseur": thickness,
+                    "Plaques de stock utilisées": stock_used,
+                    "Plaques achetées": purchased,
+                    "Total plaques": len(sheet_metas),
+                    "Surface plaques (mm²)": round(
+                        sheet_area,
+                        1,
+                    ),
+                    "Rendement matière (%)": round(
+                        yield_percentage,
+                        2,
+                    ),
+                    "Chute estimée (%)": round(
+                        100.0 - yield_percentage,
+                        2,
+                    ),
+                    "Pièces placées": len(placements),
+                    "Pièces non placées": len(unplaced),
+                }
+            )
+
+            if unplaced:
+                unplaced_messages.append(
+                    f"{material} / {thickness} : "
+                    + ", ".join(unplaced)
+                )
+
+            global_sheet_offset += len(sheet_metas)
+
+        sheet_summary = variable_sheet_statistics(
             all_placements,
-            total_sheets,
-            sheet_width,
-            sheet_height,
+            all_sheet_metas,
+        )
+        details = variable_placement_table(
+            all_placements,
+            all_sheet_metas,
+        )
+        stock_balance = stock_balance_dataframe(
+            stock_dataframe,
+            all_sheet_metas,
         )
 
         details_csv = details.to_csv(
@@ -2616,45 +4340,52 @@ if run_button:
             sep=";",
         ).encode("utf-8-sig")
 
+        stock_balance_csv = stock_balance.to_csv(
+            index=False,
+            sep=";",
+        ).encode("utf-8-sig")
+
+        export_zip = export_variable_sheets_zip(
+            all_placements,
+            all_sheet_metas,
+        )
+
         st.session_state["optitole_result"] = {
             "placements": all_placements,
+            "sheet_metas": all_sheet_metas,
             "group_reports": group_reports,
-            "total_sheets": total_sheets,
             "details": details,
             "details_csv": details_csv,
-            "export_zip": export_files.getvalue(),
-            "sheet_width": sheet_width,
-            "sheet_height": sheet_height,
+            "stock_balance": stock_balance,
+            "stock_balance_csv": stock_balance_csv,
+            "sheet_summary": sheet_summary,
+            "export_zip": export_zip,
             "missing": missing,
             "unused": unused,
             "unplaced_messages": unplaced_messages,
-            "time_budget_seconds": time_budget_seconds,
             "dxf_diagnostic": dxf_diagnostic,
-            "sheet_summary": sheet_summary,
         }
 
     except Exception as exc:
         st.exception(exc)
 
 
-# Les résultats sont affichés en dehors du bouton.
-# Ils restent donc visibles après un rafraîchissement ou un changement de tôle.
 result = st.session_state.get("optitole_result")
 
 if result is not None:
+    placements = result["placements"]
+    sheet_metas = result["sheet_metas"]
+    group_reports = result["group_reports"]
+    details = result["details"]
+    details_csv = result["details_csv"]
+    stock_balance = result["stock_balance"]
+    stock_balance_csv = result["stock_balance_csv"]
+    sheet_summary = result["sheet_summary"]
+    export_zip = result["export_zip"]
     missing = result["missing"]
     unused = result["unused"]
     unplaced_messages = result["unplaced_messages"]
-    all_placements = result["placements"]
-    group_reports = result["group_reports"]
-    total_sheets = result["total_sheets"]
-    details = result["details"]
-    details_csv = result["details_csv"]
-    export_zip = result["export_zip"]
-    result_sheet_width = result["sheet_width"]
-    result_sheet_height = result["sheet_height"]
-    dxf_diagnostic = result.get("dxf_diagnostic")
-    sheet_summary = result.get("sheet_summary")
+    dxf_diagnostic = result["dxf_diagnostic"]
 
     if missing:
         st.error(
@@ -2670,95 +4401,121 @@ if result is not None:
 
     for message in unplaced_messages:
         st.error(
-            "Pièces trop grandes ou non placées : "
+            "Pièces non placées faute de stock ou de dimensions compatibles : "
             + message
         )
 
-    st.success(
-        f"Optimisation terminée : {len(all_placements)} pièce(s) "
-        f"placée(s) sur {total_sheets} tôle(s)."
+    purchased_count = sum(
+        1 for meta in sheet_metas if meta.source == "Achat"
+    )
+    stock_count = sum(
+        1 for meta in sheet_metas if meta.source == "Stock"
     )
 
-    st.subheader("3. Diagnostic des contours DXF")
-    if dxf_diagnostic is not None:
-        st.dataframe(
-            dxf_diagnostic,
-            use_container_width=True,
-            hide_index=True,
-        )
+    st.success(
+        f"Optimisation terminée : {len(placements)} pièce(s), "
+        f"{stock_count} plaque(s) de stock utilisée(s), "
+        f"{purchased_count} plaque(s) achetée(s)."
+    )
 
-    st.subheader("4. Résumé final")
+    st.subheader("4. Diagnostic des contours DXF")
+    st.dataframe(
+        dxf_diagnostic,
+        use_container_width=True,
+        hide_index=True,
+    )
+
+    st.subheader("5. Résumé par matière et épaisseur")
     st.dataframe(
         pd.DataFrame(group_reports),
         use_container_width=True,
         hide_index=True,
     )
 
-    st.subheader("5. Rendement par tôle")
-    if sheet_summary is not None:
-        st.dataframe(
-            sheet_summary,
-            use_container_width=True,
-            hide_index=True,
-        )
+    st.subheader("6. Plaques réellement utilisées")
+    st.dataframe(
+        sheet_summary,
+        use_container_width=True,
+        hide_index=True,
+    )
 
-    st.subheader("6. Résultats détaillés")
+    st.subheader("7. Stock restant après optimisation")
+    st.dataframe(
+        stock_balance,
+        use_container_width=True,
+        hide_index=True,
+    )
+
+    st.subheader("8. Résultats détaillés")
     st.dataframe(
         details,
         use_container_width=True,
         hide_index=True,
     )
 
-    st.subheader("7. Aperçu des tôles")
+    st.subheader("9. Aperçu des plaques")
 
-    if total_sheets > 0:
-        selected_sheet = st.selectbox(
-            "Choisir la tôle à afficher",
-            options=list(range(1, total_sheets + 1)),
-            key="selected_result_sheet",
+    if sheet_metas:
+        selected_sheet_index = st.selectbox(
+            "Choisir la plaque à afficher",
+            options=list(range(len(sheet_metas))),
+            format_func=lambda index: (
+                f"{index + 1} — {sheet_metas[index].sheet_id} — "
+                f"{sheet_metas[index].width:g} × "
+                f"{sheet_metas[index].height:g} mm — "
+                f"{sheet_metas[index].source}"
+            ),
+            key="selected_stock_sheet",
         )
 
-        figure = plot_sheet(
-            all_placements,
-            selected_sheet - 1,
-            result_sheet_width,
-            result_sheet_height,
+        figure = plot_variable_sheet(
+            placements,
+            sheet_metas[selected_sheet_index],
         )
-
         st.pyplot(
             figure,
             clear_figure=True,
         )
 
-    st.subheader("8. Télécharger les résultats")
+    st.subheader("10. Télécharger les résultats")
 
-    download_left, download_right = st.columns(2)
+    download_1, download_2, download_3 = st.columns(3)
 
-    with download_left:
+    with download_1:
         st.download_button(
-            "Télécharger le rapport CSV",
+            "Rapport de placement CSV",
             data=details_csv,
-            file_name="rapport_optitole.csv",
+            file_name="rapport_optitole_v13.csv",
             mime="text/csv",
             use_container_width=True,
         )
 
-    with download_right:
+    with download_2:
         st.download_button(
-            "Télécharger les tôles DXF",
+            "Stock restant CSV",
+            data=stock_balance_csv,
+            file_name="stock_restant_optitole.csv",
+            mime="text/csv",
+            use_container_width=True,
+        )
+
+    with download_3:
+        st.download_button(
+            "Plaques optimisées DXF",
             data=export_zip,
-            file_name="optitole_resultats_dxf.zip",
+            file_name="optitole_v13_resultats_dxf.zip",
             mime="application/zip",
             use_container_width=True,
         )
+
 else:
     st.info(
-        "Aucun résultat enregistré. "
-        "Clique sur « Analyser les DXF et optimiser les tôles »."
+        "Saisis le stock, charge les DXF et la nomenclature, "
+        "puis lance l'optimisation."
     )
 
 st.divider()
 st.caption(
-    "OptiTôle Pro v11 — optimisation renforcée par alignement des bords et fusion des tôles. "
-    "Le résultat doit être contrôlé avant toute utilisation en production."
+    "OptiTôle Pro v14 — Dense Nesting Pro avec stock à dimensions variables. "
+    "Le résultat doit être contrôlé avant toute découpe réelle."
 )
