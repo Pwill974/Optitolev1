@@ -745,6 +745,7 @@ def build_pieces(
 USE_NATURAL_EDGE_ANGLES = True
 MAX_NATURAL_ROTATIONS = 36
 DENSE_CANDIDATE_MULTIPLIER = 1.0
+FILL_PRIORITY = "Hauteur 1500 mm"
 
 
 def normalize_angle(angle: float) -> float:
@@ -829,6 +830,15 @@ def piece_like_from_placement(item: Placement) -> DxfPiece:
         thickness=item.thickness,
         material=item.material,
     )
+
+
+def is_height_priority() -> bool:
+    return str(FILL_PRIORITY).startswith("Hauteur")
+
+
+def is_width_priority() -> bool:
+    return str(FILL_PRIORITY).startswith("Largeur")
+
 
 
 def rotated_at_origin(polygon: Polygon, angle: int) -> Polygon:
@@ -947,6 +957,15 @@ def candidate_positions(
 
             (sheet_width - margin - width, min_y),
             (min_x, sheet_height - margin - height),
+
+            # Spécial remplissage 1500 mm : empilement vertical strict
+            # dans la même colonne avant ouverture de la colonne suivante.
+            (min_x, max_y + clearance),
+            (min_x + clearance, max_y + clearance),
+            (max_x - width, max_y + clearance),
+            (max_x - width, margin),
+            (min_x, sheet_height - margin - height),
+            (max_x + clearance, sheet_height - margin - height),
         ):
             add_candidate(x, y)
 
@@ -1054,17 +1073,35 @@ def candidate_positions(
         if len(candidates) >= max_candidates * 4:
             break
 
-    # Un tri bas-gauche garde les meilleures positions proches du bord,
-    # mais une partie des positions plus éloignées est conservée pour éviter
-    # les minima locaux.
-    ordered = sorted(
-        candidates,
-        key=lambda position: (
-            position[1] * sheet_width + position[0],
-            position[1],
-            position[0],
-        ),
-    )
+    # Ordre des positions selon le sens de remplissage choisi.
+    # Hauteur 1500 mm : on remplit d'abord en vertical,
+    # puis on avance en largeur.
+    if is_height_priority():
+        ordered = sorted(
+            candidates,
+            key=lambda position: (
+                position[0] * sheet_height + position[1],
+                position[0],
+                position[1],
+            ),
+        )
+    elif is_width_priority():
+        ordered = sorted(
+            candidates,
+            key=lambda position: (
+                position[1] * sheet_width + position[0],
+                position[1],
+                position[0],
+            ),
+        )
+    else:
+        ordered = sorted(
+            candidates,
+            key=lambda position: (
+                position[1] * sheet_width + position[0],
+                position[0] * sheet_height + position[1],
+            ),
+        )
 
     max_candidates = max(20, int(max_candidates * DENSE_CANDIDATE_MULTIPLIER))
 
@@ -1263,16 +1300,45 @@ def placement_score(
         abs(sheet_max_y - max_y),
     )
 
+    if is_height_priority():
+        # Priorité au remplissage des 1500 mm :
+        # on garde la largeur consommée la plus faible possible,
+        # afin de remplir une colonne avant d'ouvrir la suivante.
+        return (
+            round(waste_ratio, 7),
+            round(waste, 1),
+            -contacts * 3,
+            round(distance_to_edges, 2),
+            round(envelope_area, 1),
+            round(new_max_x, 3),
+            round(new_max_y, 3),
+            round(center_x, 3),
+            round(center_y, 3),
+        )
+
+    if is_width_priority():
+        return (
+            round(waste_ratio, 7),
+            round(waste, 1),
+            -contacts * 3,
+            round(distance_to_edges, 2),
+            round(envelope_area, 1),
+            round(new_max_y, 3),
+            round(new_max_x, 3),
+            round(center_y, 3),
+            round(center_x, 3),
+        )
+
+    balance = abs((new_max_x - margin) - (new_max_y - margin))
     return (
         round(waste_ratio, 7),
         round(waste, 1),
         -contacts * 3,
         round(distance_to_edges, 2),
         round(envelope_area, 1),
+        round(balance, 3),
         round(new_max_y, 3),
         round(new_max_x, 3),
-        round(center_y, 3),
-        round(center_x, 3),
     )
 
 
@@ -1427,11 +1493,26 @@ def compactness_score(
         total_waste += max(0.0, envelope - material_area)
         total_height += max_y - margin
 
+    total_width = 0.0
+    for sheet in sheets:
+        if not sheet:
+            continue
+        max_x = max(item.polygon.bounds[2] for item in sheet)
+        total_width += max_x - margin
+
+    direction_metric = (
+        total_width
+        if is_height_priority()
+        else total_height
+        if is_width_priority()
+        else total_width + total_height
+    )
+
     return (
         len(sheets),
         round(total_waste, 1),
         round(total_envelope, 1),
-        round(total_height, 1),
+        round(direction_metric, 1),
     )
 
 
@@ -3840,10 +3921,10 @@ st.set_page_config(
     layout="wide",
 )
 
-st.title("📐 OptiTôle Pro v14 — Dense Nesting Pro")
+st.title("📐 OptiTôle Pro v15 — Remplissage 1500 mm")
 st.caption(
-    "Nesting dense avec stock disponible, rotations selon les angles réels "
-    "des pièces et remplissage renforcé des vides."
+    "Nesting dense avec choix du sens de remplissage : hauteur 1500 mm, "
+    "largeur 3000 mm ou automatique."
 )
 
 with st.sidebar:
@@ -3880,6 +3961,21 @@ with st.sidebar:
             "Minimiser le nombre de plaques",
         ],
         index=0,
+    )
+
+    fill_priority_ui = st.selectbox(
+        "Sens de remplissage prioritaire",
+        options=[
+            "Hauteur 1500 mm",
+            "Largeur 3000 mm",
+            "Automatique dense",
+        ],
+        index=0,
+        help=(
+            "Hauteur 1500 mm : l'application remplit d'abord en vertical, "
+            "puis avance en largeur. C'est le réglage conseillé pour éviter "
+            "une longue bande basse avec du vide au-dessus."
+        ),
     )
 
     margin = st.number_input(
@@ -4130,6 +4226,7 @@ if run_button:
     try:
         USE_NATURAL_EDGE_ANGLES = bool(natural_edge_angles)
         DENSE_CANDIDATE_MULTIPLIER = float(candidate_multiplier_ui)
+        FILL_PRIORITY = str(fill_priority_ui)
 
         stock_instances = prepare_stock_instances(
             stock_dataframe
@@ -4516,6 +4613,6 @@ else:
 
 st.divider()
 st.caption(
-    "OptiTôle Pro v14 — Dense Nesting Pro avec stock à dimensions variables. "
+    "OptiTôle Pro v15 — remplissage prioritaire 1500 mm et stock variable. "
     "Le résultat doit être contrôlé avant toute découpe réelle."
 )
