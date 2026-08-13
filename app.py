@@ -1366,111 +1366,6 @@ def order_piece_copies(
         min_x, min_y, max_x, max_y = polygon.bounds
         return (max_x - min_x) * (max_y - min_y)
 
-    def max_dimension(item):
-        polygon = item[0].polygon
-        min_x, min_y, max_x, max_y = polygon.bounds
-        return max(max_x - min_x, max_y - min_y)
-
-    def concavity(item):
-        polygon = item[0].polygon
-        return bbox_area(item) / max(1.0, polygon.area)
-
-    if strategy == 0:
-        ordered.sort(key=lambda item: item[0].polygon.area, reverse=True)
-    elif strategy == 1:
-        ordered.sort(key=bbox_area, reverse=True)
-    elif strategy == 2:
-        ordered.sort(key=max_dimension, reverse=True)
-    elif strategy == 3:
-        ordered.sort(key=lambda item: item[0].polygon.length, reverse=True)
-    elif strategy == 4:
-        ordered.sort(key=concavity, reverse=True)
-    elif strategy == 5:
-        ordered.sort(
-            key=lambda item: (
-                len(item[0].polygon.interiors),
-                item[0].polygon.area,
-            ),
-            reverse=True,
-        )
-    elif strategy == 6:
-        ordered.sort(
-            key=lambda item: (
-                max_dimension(item),
-                -item[0].polygon.area,
-            ),
-            reverse=True,
-        )
-    elif strategy == 7:
-        ordered.sort(key=lambda item: item[0].polygon.area, reverse=True)
-        mixed = []
-        left = 0
-        right = len(ordered) - 1
-        while left <= right:
-            mixed.append(ordered[left])
-            left += 1
-            if left <= right:
-                mixed.append(ordered[right])
-                right -= 1
-        ordered = mixed
-    elif strategy == 8:
-        ordered.sort(
-            key=lambda item: (
-                max_dimension(item),
-                item[0].polygon.area,
-            ),
-            reverse=True,
-        )
-    elif strategy == 9:
-        ordered.sort(
-            key=lambda item: (
-                concavity(item),
-                item[0].polygon.area,
-            ),
-            reverse=True,
-        )
-    elif strategy == 10:
-        ordered.sort(
-            key=lambda item: (
-                len(item[0].polygon.interiors),
-                item[0].polygon.area,
-            ),
-            reverse=True,
-        )
-    elif strategy == 11:
-        ordered.sort(key=lambda item: item[0].polygon.area)
-    elif strategy == 12:
-        big = sorted(ordered, key=lambda item: item[0].polygon.area, reverse=True)
-        small = sorted(ordered, key=lambda item: item[0].polygon.area)
-        mixed = []
-        while big or small:
-            if big:
-                candidate = big.pop(0)
-                if candidate not in mixed:
-                    mixed.append(candidate)
-            if small:
-                candidate = small.pop(0)
-                if candidate not in mixed:
-                    mixed.append(candidate)
-        ordered = mixed
-    elif strategy == 13:
-        ordered.sort(
-            key=lambda item: (
-                round(max_dimension(item) / max(1.0, min(
-                    item[0].polygon.bounds[2] - item[0].polygon.bounds[0],
-                    item[0].polygon.bounds[3] - item[0].polygon.bounds[1],
-                )), 3),
-                item[0].polygon.area,
-            ),
-            reverse=True,
-        )
-    elif strategy == 14:
-        random.Random(2000 + attempt_index * 41).shuffle(ordered)
-        ordered.sort(key=lambda item: item[0].polygon.area, reverse=True)
-    else:
-        random.Random(1000 + attempt_index * 37).shuffle(ordered)
-
-    return ordered
 
 
 def compactness_score(
@@ -2338,6 +2233,55 @@ def nest_pieces(
 # ============================================================
 # V13 — Stock de tôles à dimensions variables
 # ============================================================
+
+
+# ============================================================
+# Correctifs géométriques globaux v18
+# ============================================================
+
+def _geometry_from_any_item(item):
+    """
+    Récupère le polygone depuis :
+    - un tuple (DxfPiece, copie)
+    - un DxfPiece
+    - un Placement
+    """
+    if isinstance(item, tuple) and item:
+        first = item[0]
+        if hasattr(first, "polygon"):
+            return first.polygon
+        if hasattr(first, "original_polygon"):
+            return first.original_polygon
+
+    if hasattr(item, "polygon"):
+        return item.polygon
+
+    if hasattr(item, "original_polygon"):
+        return item.original_polygon
+
+    raise ValueError("Objet géométrique non reconnu.")
+
+
+def max_dimension(item) -> float:
+    polygon = _geometry_from_any_item(item)
+    min_x, min_y, max_x, max_y = polygon.bounds
+    return max(max_x - min_x, max_y - min_y)
+
+
+def min_dimension(item) -> float:
+    polygon = _geometry_from_any_item(item)
+    min_x, min_y, max_x, max_y = polygon.bounds
+    return min(max_x - min_x, max_y - min_y)
+
+
+def concavity(item) -> float:
+    polygon = _geometry_from_any_item(item)
+    min_x, min_y, max_x, max_y = polygon.bounds
+    bounding_area = max(1.0, (max_x - min_x) * (max_y - min_y))
+    polygon_area = max(1.0, polygon.area)
+    return bounding_area / polygon_area
+
+
 
 @dataclass
 class StockSheet:
@@ -4141,15 +4085,13 @@ def export_sheets_zip(
 # ============================================================
 
 st.set_page_config(
-    page_title="OptiTôle Pro v13",
+    page_title="OptiTôle Pro v18 — Correctif définitif colonnes",
     page_icon="📐",
     layout="wide",
 )
 
-st.title("📐 OptiTôle Pro v17 — Correctif colonnes 1500")
-st.caption(
-    "Correctif du remplissage par colonnes 1500 mm avec fonctions géométriques manquantes."
-)
+st.title("📐 OptiTôle Pro v18 — Correctif définitif colonnes")
+st.caption("Version v18 : correctif définitif max_dimension + remplissage vertical 1500 mm.")
 
 with st.sidebar:
     st.header("Paramètres de découpe")
