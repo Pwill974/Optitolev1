@@ -4146,9 +4146,9 @@ st.set_page_config(
     layout="wide",
 )
 
-st.title("📐 OptiTôle Pro v16 — Colonnes 1500 mm")
+st.title("📐 OptiTôle Pro v17 — Correctif colonnes 1500")
 st.caption(
-    "Nesting dense avec vrai remplissage par colonnes sur la hauteur 1500 mm."
+    "Correctif du remplissage par colonnes 1500 mm avec fonctions géométriques manquantes."
 )
 
 with st.sidebar:
@@ -4837,6 +4837,6 @@ else:
 
 st.divider()
 st.caption(
-    "OptiTôle Pro v16 — remplissage par colonnes 1500 mm et stock variable. "
+    "OptiTôle Pro v17 — correctif colonnes 1500 mm et stock variable. "
     "Le résultat doit être contrôlé avant toute découpe réelle."
 )
