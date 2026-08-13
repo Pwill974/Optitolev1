@@ -1366,6 +1366,111 @@ def order_piece_copies(
         min_x, min_y, max_x, max_y = polygon.bounds
         return (max_x - min_x) * (max_y - min_y)
 
+    def max_dimension(item):
+        polygon = item[0].polygon
+        min_x, min_y, max_x, max_y = polygon.bounds
+        return max(max_x - min_x, max_y - min_y)
+
+    def concavity(item):
+        polygon = item[0].polygon
+        return bbox_area(item) / max(1.0, polygon.area)
+
+    if strategy == 0:
+        ordered.sort(key=lambda item: item[0].polygon.area, reverse=True)
+    elif strategy == 1:
+        ordered.sort(key=bbox_area, reverse=True)
+    elif strategy == 2:
+        ordered.sort(key=max_dimension, reverse=True)
+    elif strategy == 3:
+        ordered.sort(key=lambda item: item[0].polygon.length, reverse=True)
+    elif strategy == 4:
+        ordered.sort(key=concavity, reverse=True)
+    elif strategy == 5:
+        ordered.sort(
+            key=lambda item: (
+                len(item[0].polygon.interiors),
+                item[0].polygon.area,
+            ),
+            reverse=True,
+        )
+    elif strategy == 6:
+        ordered.sort(
+            key=lambda item: (
+                max_dimension(item),
+                -item[0].polygon.area,
+            ),
+            reverse=True,
+        )
+    elif strategy == 7:
+        ordered.sort(key=lambda item: item[0].polygon.area, reverse=True)
+        mixed = []
+        left = 0
+        right = len(ordered) - 1
+        while left <= right:
+            mixed.append(ordered[left])
+            left += 1
+            if left <= right:
+                mixed.append(ordered[right])
+                right -= 1
+        ordered = mixed
+    elif strategy == 8:
+        ordered.sort(
+            key=lambda item: (
+                max_dimension(item),
+                item[0].polygon.area,
+            ),
+            reverse=True,
+        )
+    elif strategy == 9:
+        ordered.sort(
+            key=lambda item: (
+                concavity(item),
+                item[0].polygon.area,
+            ),
+            reverse=True,
+        )
+    elif strategy == 10:
+        ordered.sort(
+            key=lambda item: (
+                len(item[0].polygon.interiors),
+                item[0].polygon.area,
+            ),
+            reverse=True,
+        )
+    elif strategy == 11:
+        ordered.sort(key=lambda item: item[0].polygon.area)
+    elif strategy == 12:
+        big = sorted(ordered, key=lambda item: item[0].polygon.area, reverse=True)
+        small = sorted(ordered, key=lambda item: item[0].polygon.area)
+        mixed = []
+        while big or small:
+            if big:
+                candidate = big.pop(0)
+                if candidate not in mixed:
+                    mixed.append(candidate)
+            if small:
+                candidate = small.pop(0)
+                if candidate not in mixed:
+                    mixed.append(candidate)
+        ordered = mixed
+    elif strategy == 13:
+        ordered.sort(
+            key=lambda item: (
+                round(max_dimension(item) / max(1.0, min(
+                    item[0].polygon.bounds[2] - item[0].polygon.bounds[0],
+                    item[0].polygon.bounds[3] - item[0].polygon.bounds[1],
+                )), 3),
+                item[0].polygon.area,
+            ),
+            reverse=True,
+        )
+    elif strategy == 14:
+        random.Random(2000 + attempt_index * 41).shuffle(ordered)
+        ordered.sort(key=lambda item: item[0].polygon.area, reverse=True)
+    else:
+        random.Random(1000 + attempt_index * 37).shuffle(ordered)
+
+    return ordered
 
 
 def compactness_score(
@@ -2234,55 +2339,6 @@ def nest_pieces(
 # V13 — Stock de tôles à dimensions variables
 # ============================================================
 
-
-# ============================================================
-# Correctifs géométriques globaux v18
-# ============================================================
-
-def _geometry_from_any_item(item):
-    """
-    Récupère le polygone depuis :
-    - un tuple (DxfPiece, copie)
-    - un DxfPiece
-    - un Placement
-    """
-    if isinstance(item, tuple) and item:
-        first = item[0]
-        if hasattr(first, "polygon"):
-            return first.polygon
-        if hasattr(first, "original_polygon"):
-            return first.original_polygon
-
-    if hasattr(item, "polygon"):
-        return item.polygon
-
-    if hasattr(item, "original_polygon"):
-        return item.original_polygon
-
-    raise ValueError("Objet géométrique non reconnu.")
-
-
-def max_dimension(item) -> float:
-    polygon = _geometry_from_any_item(item)
-    min_x, min_y, max_x, max_y = polygon.bounds
-    return max(max_x - min_x, max_y - min_y)
-
-
-def min_dimension(item) -> float:
-    polygon = _geometry_from_any_item(item)
-    min_x, min_y, max_x, max_y = polygon.bounds
-    return min(max_x - min_x, max_y - min_y)
-
-
-def concavity(item) -> float:
-    polygon = _geometry_from_any_item(item)
-    min_x, min_y, max_x, max_y = polygon.bounds
-    bounding_area = max(1.0, (max_x - min_x) * (max_y - min_y))
-    polygon_area = max(1.0, polygon.area)
-    return bounding_area / polygon_area
-
-
-
 @dataclass
 class StockSheet:
     instance_id: str
@@ -2615,185 +2671,6 @@ def quality_parameters(quality_mode: str) -> tuple[int, int, int]:
     return settings.get(quality_mode, settings["Équilibré"])
 
 
-
-def vertical_column_fill_one_sheet(
-    remaining: list[tuple[DxfPiece, int]],
-    width: float,
-    height: float,
-    margin: float,
-    clearance: float,
-    rotations: list[int],
-    rotation_cache: dict[tuple[str, int], Polygon],
-    deadline: float,
-) -> list[Placement]:
-    """
-    Remplit la plaque par colonnes : d'abord la hauteur, puis la largeur.
-    """
-    if not remaining:
-        return []
-
-    inner_right = width - margin
-    inner_top = height - margin
-    current_x = margin
-    current_y = margin
-    column_width = 0.0
-    placements: list[Placement] = []
-
-    ordered = sorted(
-        remaining,
-        key=lambda item: (
-            max_dimension(item),
-            item[0].polygon.area,
-        ),
-        reverse=True,
-    )
-
-    for piece, copy_index in ordered:
-        if time.perf_counter() >= deadline:
-            break
-
-        versions = []
-
-        for angle in piece_rotation_angles(piece, rotations):
-            cache_key = (piece.reference_key, angle)
-
-            if cache_key not in rotation_cache:
-                rotation_cache[cache_key] = rotated_at_origin(
-                    piece.polygon,
-                    angle,
-                )
-
-            polygon = rotation_cache[cache_key]
-            piece_width = polygon.bounds[2] - polygon.bounds[0]
-            piece_height = polygon.bounds[3] - polygon.bounds[1]
-
-            if (
-                piece_width <= width - 2 * margin + 1e-6
-                and piece_height <= height - 2 * margin + 1e-6
-            ):
-                versions.append(
-                    (
-                        angle,
-                        polygon,
-                        piece_width,
-                        piece_height,
-                    )
-                )
-
-        if not versions:
-            continue
-
-        versions.sort(
-            key=lambda item: (
-                item[2],
-                -item[3],
-            )
-        )
-
-        placed = False
-
-        for angle, polygon, piece_width, piece_height in versions:
-            if (
-                current_x + max(column_width, piece_width)
-                <= inner_right + 1e-6
-                and current_y + piece_height <= inner_top + 1e-6
-            ):
-                candidate = affinity.translate(
-                    polygon,
-                    xoff=current_x,
-                    yoff=current_y,
-                )
-                placements.append(
-                    Placement(
-                        reference=piece.reference_display,
-                        source_name=piece.source_name,
-                        sheet_index=0,
-                        rotation=angle,
-                        polygon=candidate,
-                        original_polygon=piece.polygon,
-                        copy_index=copy_index,
-                        thickness=piece.thickness,
-                        material=piece.material,
-                    )
-                )
-                current_y += piece_height + clearance
-                column_width = max(column_width, piece_width)
-                placed = True
-                break
-
-        if placed:
-            continue
-
-        new_x = current_x + column_width + clearance
-        best_new_column = None
-
-        for angle, polygon, piece_width, piece_height in versions:
-            if (
-                new_x + piece_width <= inner_right + 1e-6
-                and margin + piece_height <= inner_top + 1e-6
-            ):
-                score = (
-                    piece_width,
-                    -piece_height,
-                )
-                if best_new_column is None or score < best_new_column[0]:
-                    best_new_column = (
-                        score,
-                        angle,
-                        polygon,
-                        piece_width,
-                        piece_height,
-                    )
-
-        if best_new_column is None:
-            continue
-
-        _, angle, polygon, piece_width, piece_height = best_new_column
-        current_x = new_x
-        current_y = margin
-        column_width = piece_width
-
-        candidate = affinity.translate(
-            polygon,
-            xoff=current_x,
-            yoff=current_y,
-        )
-        placements.append(
-            Placement(
-                reference=piece.reference_display,
-                source_name=piece.source_name,
-                sheet_index=0,
-                rotation=angle,
-                polygon=candidate,
-                original_polygon=piece.polygon,
-                copy_index=copy_index,
-                thickness=piece.thickness,
-                material=piece.material,
-            )
-        )
-        current_y += piece_height + clearance
-
-    safe: list[Placement] = []
-    sheet_inner = box(
-        margin,
-        margin,
-        width - margin,
-        height - margin,
-    )
-
-    for item in placements:
-        if fits_on_sheet(
-            item.polygon,
-            [placed.polygon for placed in safe],
-            sheet_inner,
-            clearance,
-        ):
-            safe.append(item)
-
-    return safe
-
-
-
 def fill_one_variable_sheet(
     remaining: list[tuple[DxfPiece, int]],
     width: float,
@@ -2812,44 +2689,6 @@ def fill_one_variable_sheet(
     attempts, quality_level, max_candidates = quality_parameters(quality_mode)
     best_placements: list[Placement] = []
     best_score = None
-
-    if is_height_priority():
-        column_deadline = min(
-            deadline,
-            time.perf_counter()
-            + max(2.0, (deadline - time.perf_counter()) * 0.25),
-        )
-        column_placements = vertical_column_fill_one_sheet(
-            remaining,
-            width,
-            height,
-            margin,
-            clearance,
-            rotations,
-            rotation_cache,
-            column_deadline,
-        )
-
-        if column_placements:
-            used_area = sum(
-                item.original_polygon.area
-                for item in column_placements
-            )
-            max_x = max(
-                item.polygon.bounds[2]
-                for item in column_placements
-            )
-            max_y = max(
-                item.polygon.bounds[3]
-                for item in column_placements
-            )
-            best_placements = column_placements
-            best_score = (
-                -len(column_placements),
-                -round(used_area, 2),
-                round(max_x, 2),
-                round(max_y, 2),
-            )
 
     for attempt_index in range(attempts):
         if time.perf_counter() >= deadline:
@@ -2890,20 +2729,12 @@ def fill_one_variable_sheet(
             max_x = width
             max_y = height
 
-        if is_height_priority():
-            score = (
-                -len(placements),
-                -round(used_area, 2),
-                round(max_x, 2),
-                round(max_y, 2),
-            )
-        else:
-            score = (
-                -len(placements),
-                -round(used_area, 2),
-                round(max_y, 2),
-                round(max_x, 2),
-            )
+        score = (
+            -round(used_area, 2),
+            -len(placements),
+            round(max_y, 2),
+            round(max_x, 2),
+        )
 
         if best_score is None or score < best_score:
             best_score = score
@@ -4085,13 +3916,16 @@ def export_sheets_zip(
 # ============================================================
 
 st.set_page_config(
-    page_title="OptiTôle Pro v18 — Correctif définitif colonnes",
+    page_title="OptiTôle Pro v13",
     page_icon="📐",
     layout="wide",
 )
 
-st.title("📐 OptiTôle Pro v18 — Correctif définitif colonnes")
-st.caption("Version v18 : correctif définitif max_dimension + remplissage vertical 1500 mm.")
+st.title("📐 OptiTôle Pro v15 — Remplissage 1500 mm")
+st.caption(
+    "Nesting dense avec choix du sens de remplissage : hauteur 1500 mm, "
+    "largeur 3000 mm ou automatique."
+)
 
 with st.sidebar:
     st.header("Paramètres de découpe")
@@ -4779,6 +4613,6 @@ else:
 
 st.divider()
 st.caption(
-    "OptiTôle Pro v17 — correctif colonnes 1500 mm et stock variable. "
+    "OptiTôle Pro v15 — remplissage prioritaire 1500 mm et stock variable. "
     "Le résultat doit être contrôlé avant toute découpe réelle."
 )
